@@ -21,7 +21,11 @@ const WRAPPER = path.join(__dirname, '..', 'bin', 'termcp.js');
 const HOME = (process.env.TERMCP_DATA_DIR || '').trim() || path.join(os.homedir(), '.termcp');
 const VERSIONS = path.join(HOME, 'versions');
 const VERSION_FILE = path.join(HOME, '.version');
-const ASSET = process.platform === 'win32' ? 'termcp-windows-amd64.exe' : 'termcp-linux-amd64';
+const ASSET = {
+  win32: { x64: 'termcp-windows-amd64.exe', arm64: 'termcp-windows-arm64.exe' },
+  darwin: { x64: 'termcp-darwin-amd64', arm64: 'termcp-darwin-arm64' },
+  linux: { x64: 'termcp-linux-amd64', arm64: 'termcp-linux-arm64' },
+}[process.platform]?.[process.arch];
 const BIN = (tag) => path.join(VERSIONS, tag, process.platform === 'win32' ? 'termcp.exe' : 'termcp');
 
 const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
@@ -89,7 +93,8 @@ function mirror(body, { delayMs = 0, dieAfter = 0, tag = '' } = {}) {
     const again = await runWrapper(null, null, 30000);
     assert.equal(again.status, 0, 'cached run must work');
     assert.match(again.stdout, /termcp v?\d/, 'cached run must still pass through');
-    assert.ok(!/probing/.test(again.stderr), 'cached run must not download: ' + again.stderr);
+    assert.ok(!/\[(?:probe|download)\]/.test(again.stderr), 'cached run must not download: ' + again.stderr);
+    assert.match(again.stderr, /\[cache\] using installed/, 'cached run should explain the cache hit');
     console.log('ok: cached run performs no download');
   }
 
@@ -175,7 +180,7 @@ function mirror(body, { delayMs = 0, dieAfter = 0, tag = '' } = {}) {
     const run = await runWrapper(null, null, 60000, { TERMCP_SKIP_DOWNLOAD: '1', PATH: dir });
     fs.rmSync(dir, { recursive: true, force: true });
     assert.equal(run.status, 0, 'SKIP_DOWNLOAD must use the binary on PATH: ' + run.stderr);
-    assert.ok(!/probing/.test(run.stderr), 'SKIP_DOWNLOAD must not download');
+    assert.ok(!/\[(?:probe|download)\]/.test(run.stderr), 'SKIP_DOWNLOAD must not download');
     console.log('ok: TERMCP_SKIP_DOWNLOAD uses the PATH binary, no download');
   }
 

@@ -56,7 +56,12 @@ const FAST_BYTES = 204800;      // first source to reach this wins, no waiting
 const STALL_MS = 15000;         // no bytes for this long -> give up on this source
 
 const die = (msg) => { console.error(`termcp: ${msg}`); process.exit(1); };
+const log = (step, message) => console.error(`termcp: [${step}] ${message}`);
 const mbps = (bps) => (bps >= 1048576 ? `${(bps / 1048576).toFixed(1)} MB/s` : `${Math.round(bps / 1024)} KB/s`);
+function sourceName(url) {
+  if (url.startsWith(`https://github.com/${REPO}/releases/`)) return 'GitHub';
+  try { return new URL(url).host; } catch { return 'configured mirror'; }
+}
 
 function assetName() {
   const name = (ASSETS[process.platform] || {})[process.arch];
@@ -90,8 +95,9 @@ function rememberVersion(tag) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(VERSION_FILE, tag + '\n');
+    log('version', `remembered ${tag} for future runs`);
   } catch (e) {
-    console.error(`termcp: could not write ${VERSION_FILE}: ${e.message}`);
+    log('version', `could not remember ${tag}: ${e.message}`);
   }
   process.env.TERMCP_VERSION = tag; // so anything we spawn sees the same pin
 }
@@ -164,14 +170,16 @@ async function measureAll(sources, part) {
     winner = url;
     for (const [u, ac] of controllers) if (u !== url) ac.abort();
   };
-  const results = await Promise.all(sources.map((url, i) => probe(url, `${part}.probe${i}`, { onFast, controllers })));
+  const results = await Promise.all(sources.map((url, i) =>
+    probe(url, `${part}.probe${i}`, { onFast, controllers }).then((result) => ({ ...result, index: i + 1 }))));
   results.sort((a, b) => b.got - a.got);
   const won = winner || (results[0] && results[0].url);
+  results.sort((a, b) => Number(b.url === won) - Number(a.url === won) || b.got - a.got);
   for (const r of results) {
     const line = r.got > 0
       ? `${String(Math.round(r.got / 1024)).padStart(4)} KB in ${r.secs.toFixed(1)}s (${mbps(r.speed)})`
       : 'no data';
-    console.error(`termcp: ${r.url === won ? '→' : ' '} ${line} ${r.url}`);
+    log('probe', `${r.index}/${sources.length} ${sourceName(r.url)}: ${line}${r.url === won ? ' — selected' : ''}`);
   }
   return results;
 }
@@ -186,6 +194,7 @@ async function resume(url, part, total) {
   const ac = new AbortController();
   let stall = setTimeout(() => ac.abort(new Error(`no data for ${STALL_MS / 1000}s`)), STALL_MS);
   const out = fs.createWriteStream(part, { flags: offset ? 'a' : 'w', mode: 0o600 });
+  let showedProgress = false;
   try {
     const res = await fetch(url, {
       headers: offset ? { Range: `bytes=${offset}-` } : {},
@@ -203,17 +212,19 @@ async function resume(url, part, total) {
       stall = setTimeout(() => ac.abort(new Error(`no data for ${STALL_MS / 1000}s`)), STALL_MS);
       got += chunk.length;
       if (!out.write(chunk)) await new Promise((r) => out.once('drain', r));
-      if (Date.now() - last > 2000) {
+      if (process.stderr.isTTY && Date.now() - last > 2000) {
         last = Date.now();
+        showedProgress = true;
         const have = offset + got;
         process.stderr.write(`\rtermcp: ${(have / 1048576).toFixed(1)} MB${known ? ` ${((have / known) * 100).toFixed(0)}%` : ''}   `);
       }
     }
-    process.stderr.write('\r');
+    if (showedProgress) process.stderr.write('\n');
     await new Promise((r, j) => out.end((e) => (e ? j(e) : r())));
     if (size && offset + got > size) throw new Error(`source sent more than the file has (${offset + got} > ${size})`);
     return offset + got;
   } catch (e) {
+    if (showedProgress) process.stderr.write('\n');
     out.destroy();
     throw e;
   } finally {
@@ -258,23 +269,35 @@ function installedTags() {
 // pin is never written there.
 async function resolveVersion(asset) {
   const requested = (process.env.TERMCP_VERSION || '').trim();
-  if (requested && requested !== 'latest') return { tag: normalizeTag(requested), remember: false, meta: null };
+  if (requested && requested !== 'latest') {
+    const tag = normalizeTag(requested);
+    log('version', `using pinned release ${tag}`);
+    return { tag, remember: false, meta: null };
+  }
 
   if (!requested) {
     const remembered = readVersionFile();
-    if (remembered) return { tag: normalizeTag(remembered), remember: false, meta: null };
+    if (remembered) {
+      const tag = normalizeTag(remembered);
+      log('version', `using remembered release ${tag}`);
+      return { tag, remember: false, meta: null };
+    }
   }
 
   // No pin, or an explicit `latest`: ask GitHub for the newest release.
+  log('version', 'checking GitHub for the latest release');
   const meta = await releaseMeta(asset);
-  if (meta.tag) return { tag: meta.tag, remember: true, meta };
+  if (meta.tag) {
+    log('version', `latest release is ${meta.tag}`);
+    return { tag: meta.tag, remember: true, meta };
+  }
 
   // Offline. Stay on something already here instead of failing: the remembered
   // version first, then whatever is installed. A network is needed only to
   // fetch a release we have never seen, and that cannot work right now anyway.
   const fallback = readVersionFile() || installedTags()[0];
   if (fallback) {
-    console.error(`termcp: GitHub unreachable, staying on ${normalizeTag(fallback)}`);
+    log('version', `GitHub unreachable, staying on ${normalizeTag(fallback)}`);
     return { tag: normalizeTag(fallback), remember: false, meta: { offline: true } };
   }
   die('GitHub is unreachable and no termcp version is installed; set TERMCP_VERSION to a release you can fetch');
@@ -298,8 +321,12 @@ function onPath() {
 
 // Resolve the binary, downloading the release asset on first use.
 async function binary() {
-  if (process.env.TERMCP_BIN) return process.env.TERMCP_BIN;
+  if (process.env.TERMCP_BIN) {
+    log('binary', 'using TERMCP_BIN override');
+    return process.env.TERMCP_BIN;
+  }
   if (process.env.TERMCP_SKIP_DOWNLOAD) {
+    log('binary', 'looking for an installed termcp on PATH');
     if (process.env.TERMCP_WRAPPER_DEPTH) {
       die('the termcp on PATH is this npm wrapper itself; set TERMCP_BIN to a real binary');
     }
@@ -307,6 +334,7 @@ async function binary() {
     if (!found) {
       die(`TERMCP_SKIP_DOWNLOAD is set and no termcp${process.platform === 'win32' ? '.exe' : ''} on PATH; set TERMCP_BIN`);
     }
+    log('binary', 'using termcp from PATH');
     return found;
   }
 
@@ -318,15 +346,19 @@ async function binary() {
     // this run resolved it (first run, or an explicit `latest`), otherwise a
     // later run would fall back to the stale .version.
     if (remember) rememberVersion(tag);
+    log('cache', `using installed ${tag} for ${process.platform}/${process.arch}`);
     return dest;
   }
 
   // Need the release's digest (and size) before fetching bytes.
+  if (!(initial && initial.tag)) log('metadata', `checking release ${tag} for ${asset}`);
   const meta = initial && initial.tag ? initial : await releaseMeta(asset, tag);
   if (meta.offline) {
-    console.error(`termcp: GitHub API unreachable, downloading ${tag} unverified`);
+    log('metadata', `GitHub API unreachable; ${tag} cannot be checksum-verified`);
   } else if (!meta.sha256) {
-    console.error(`termcp: no digest for ${asset} in ${tag} — downloading unverified`);
+    log('metadata', `no SHA-256 digest for ${asset} in ${tag}; download cannot be checksum-verified`);
+  } else {
+    log('metadata', `SHA-256 available for ${asset}${meta.size ? ` (${(meta.size / 1048576).toFixed(1)} MB)` : ''}`);
   }
 
   const canonical = `https://github.com/${REPO}/releases/download/${tag}/${asset}`;
@@ -335,7 +367,7 @@ async function binary() {
 
   const { sha256, size } = meta;
   const part = `${dest}.${process.pid}.part`;
-  console.error(`termcp: installing ${tag} for ${process.platform}/${process.arch}; probing ${sources.length} sources…`);
+  log('probe', `measuring ${sources.length} sources for ${tag} (${process.platform}/${process.arch})`);
   const ranked = await measureAll(sources, part);
 
   // Keep the winner's probed bytes; the rest is fetched from where it stopped.
@@ -345,16 +377,21 @@ async function binary() {
 
   try {
     let lastError;
-    for (const r of ranked) {
+    for (const [index, r] of ranked.entries()) {
       try {
+        const offset = fs.existsSync(part) ? fs.statSync(part).size : 0;
+        log('download', `${offset ? 'resuming' : 'starting'} from ${sourceName(r.url)} (${index + 1}/${ranked.length})${offset ? ` at ${(offset / 1048576).toFixed(1)} MB` : ''}`);
         const have = await resume(r.url, part, size);
         if (size && have < size) throw new Error(`source stopped early: ${have}/${size} bytes`);
+        log('download', `received ${(have / 1048576).toFixed(1)} MB`);
+        log('verify', sha256 ? 'checking file size and SHA-256' : size ? 'checking file size (SHA-256 unavailable)' : 'no published size or SHA-256 to check');
         await verify(part, dest, sha256, size);
+        log('install', `installed ${tag} for ${process.platform}/${process.arch}`);
         if (remember) rememberVersion(tag);
         return dest;
       } catch (e) {
         lastError = e;
-        console.error(`termcp: ${e.message} — ${fs.existsSync(part) ? fs.statSync(part).size : 0} bytes so far, next source`);
+        log('download', `${sourceName(r.url)} failed: ${e.message} (${fs.existsSync(part) ? fs.statSync(part).size : 0} bytes saved)${index + 1 < ranked.length ? '; trying next source' : ''}`);
       }
     }
     throw new Error(`all ${ranked.length} sources failed (last: ${lastError && lastError.message})`);
@@ -365,6 +402,7 @@ async function binary() {
 
 (async () => {
   const bin = await binary();
+  log('launch', 'starting termcp');
   // The depth marker stops a PATH lookup from re-entering this wrapper.
   const depth = String((Number(process.env.TERMCP_WRAPPER_DEPTH) || 0) + 1);
   const child = spawn(bin, process.argv.slice(2), {

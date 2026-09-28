@@ -21,6 +21,16 @@ termcp --help           # every flag is the binary's own
 
 Node 18+; no Go toolchain (the binary is fetched prebuilt).
 
+### Startup logs
+
+On the first run, the wrapper reports each stage to stderr: release selection,
+release metadata, source probing, download, verification, installation, and
+launch. The download shows live progress in an interactive terminal. If one
+source fails, the log identifies the failure and the next source being tried.
+Later runs report the remembered version, cache hit, and launch without another
+download. A pinned version or `TERMCP_BIN` override is also shown before launch.
+The binary's own stdout and stderr remain connected to your terminal.
+
 ## Which version runs
 
 | Order | Source | Effect |
@@ -49,14 +59,13 @@ remembered one. To move to the newest release, run
 
 ### Checksums and mirrors
 
-The sha256 always comes from the GitHub releases API (`assets[].digest`) — a few
-KB, authoritative, and fast even when the release CDN is not. Only the bytes
-come from mirrors: every source (including `github.com`) is probed in parallel,
-the fastest one is used, a mid-download failure hands over to the next source at
-the same byte offset, and the finished file must match the official digest or it
-is thrown away and never installed. A wrong or malicious mirror cannot get code
-onto your machine. If the API itself is unreachable the wrapper says so and
-downloads unverified.
+When available, the sha256 comes from the GitHub releases API
+(`assets[].digest`), while the binary bytes can come from mirrors. Every source
+(including `github.com`) is probed in parallel; the fastest one is used, and a
+mid-download failure hands over to the next source at the same byte offset.
+With a published digest, the finished file must match it or installation fails.
+If the API or digest is unavailable, the wrapper clearly warns that it cannot
+verify the download's checksum.
 
 ## Uninstall
 
