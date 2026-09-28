@@ -1,0 +1,30 @@
+{
+  "name": "@open-mcp-ai/termcp",
+  "version": "0.0.2",
+  "description": "npm wrapper for the termcp binary: one cross-platform session layer for humans, agents and scripts, across local and remote terminals.",
+  "license": "MIT",
+  "bin": {
+    "termcp": "bin/termcp.js"
+  },
+  "files": [
+    "bin/termcp.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "terminal",
+    "ssh",
+    "termcp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/open-mcp-ai/termcp.git"
+  },
+  "scripts": {
+    "test": "node test/wrapper.test.js"
+  }
+}
