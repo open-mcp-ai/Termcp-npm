@@ -22,10 +22,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/open-mcp-ai/Termcp-npm.git"
+    "url": "git+https://github.com/open-mcp-ai/termcp.git"
   },
   "homepage": "https://github.com/open-mcp-ai/termcp#readme",
-  "bugs": "https://github.com/open-mcp-ai/Termcp-npm/issues",
+  "bugs": "https://github.com/open-mcp-ai/termcp/issues",
   "scripts": {
     "test": "node test/wrapper.test.js"
   }
