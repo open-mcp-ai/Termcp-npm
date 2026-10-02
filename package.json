@@ -1,6 +1,6 @@
 {
   "name": "@open-mcp-ai/termcp",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "npm wrapper for the termcp binary: one cross-platform session layer for humans, agents and scripts, across local and remote terminals.",
   "license": "MIT",
   "bin": {
