@@ -12,11 +12,6 @@ npx -y @open-mcp-ai/termcp           # once (no install prompt)
 npm i -g @open-mcp-ai/termcp         # or install the `termcp` command
 ```
 
-```bash
-termcp                  # Web UI + MCP on http://127.0.0.1:18765
-termcp --help           # every flag is the binary's own
-```
-
 Node 18+; no Go toolchain (the binary is fetched prebuilt).
 
 ## MCP over stdio (termcp v0.2.5+)
@@ -45,6 +40,28 @@ claude mcp add termcp -- npx -y @open-mcp-ai/termcp daemon stdio
 | `TERMCP_BIN`           | Run this binary instead of downloading one (e.g. a local build).       |
 | `TERMCP_MIRROR`        | Comma-separated mirror prefixes to probe instead of the built-in list. |
 | `TERMCP_SKIP_DOWNLOAD` | Never download; use `TERMCP_BIN` or whatever `termcp` is on `PATH`.    |
+| `TERMCP_API`           | GitHub API base (default `https://api.github.com`); for a mirror or a test server. |
+| `TERMCP_SKIP_VERIFY`   | Install a release that publishes no SHA-256 digest. A digest that disagrees with the bytes still fails. |
+
+## Channels and switching versions
+
+termcp never checks for updates on its own: a regular launch reads
+`~/.termcp/.version` and touches no network. When you want to move:
+
+```bash
+# Switch version
+termcp use latest             # newest release on the line .version is already on
+termcp use <tag>              # one specific release — downgrade, upgrade, or pinned
+termcp use --channel rc       # move onto the rc line and switch to its newest
+termcp use --channel nightly  # move onto the rolling nightly line
+
+# Update and restart a running daemon in one go
+termcp use latest && termcp daemon stop
+```
+
+`use` only writes `.version`, so an instance already serving keeps the old binary;
+`daemon stop` ends it, and whatever starts termcp next (`termcp`, an MCP client, the Web UI)
+picks up the new one.
 
 
 ## Uninstall

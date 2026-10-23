@@ -15,10 +15,26 @@
 // bytes come from whichever source measures fastest — mirrors included. The
 // final sha256 is what makes a mirror untrusted-but-usable.
 //
+// One command-line word belongs to this wrapper and never reaches the binary:
+//   use <tag>|latest [--channel <name>]
+//                  make that release the one launches run, then exit. `latest`
+//                  means the newest release on the line .version is already on;
+//                  --channel moves to another line for that one command; a tag
+//                  is any release, newer or older.
+// A line is named by its tags (`v0.2.8` stable, `v0.2.8-rc.1` rc, `v0.3.0-beta.2`
+// beta, `nightly-20261002` nightly), so no channel is hard-coded here and a new
+// line needs no change.
+// Nothing checks for updates on its own, and nothing records a channel:
+// `.version` holds the tag, the tag says which line it is on, and a launch reads
+// it and touches no network. A version already on disk switches instantly and
+// offline — which is also how a downgrade works.
+//
 // Env: TERMCP_VERSION (pin, or "latest" to refresh), TERMCP_BIN (use this
 //      binary, skip everything), TERMCP_MIRROR (comma-separated prefixes),
 //      TERMCP_DATA_DIR (termcp's data directory; defaults to ~/.termcp),
-//      TERMCP_SKIP_DOWNLOAD.
+//      TERMCP_SKIP_DOWNLOAD, TERMCP_API (GitHub API base; defaults to
+//      https://api.github.com), TERMCP_SKIP_VERIFY (install a release that has
+//      no digest to check against).
 //
 // Cache location: the data directory itself, exactly as termcp resolves it
 // (config.DefaultDataDir) — $TERMCP_DATA_DIR when set, else ~/.termcp. The
@@ -31,9 +47,16 @@ const path = require('node:path');
 const os = require('node:os');
 
 const DATA_DIR = (process.env.TERMCP_DATA_DIR || '').trim() || path.join(os.homedir(), '.termcp');
+// Install a release that publishes no digest to check against. The check itself
+// is never skipped: a digest that disagrees with the bytes is corruption, and
+// that download fails with or without this.
+const SKIP_VERIFY = !!process.env.TERMCP_SKIP_VERIFY;
 const VERSIONS_DIR = path.join(DATA_DIR, 'versions');
 const VERSION_FILE = path.join(DATA_DIR, '.version');
 const REPO = 'open-mcp-ai/termcp';
+// GitHub API base. TERMCP_API exists so the channel resolution can be tested
+// against a local server instead of whatever GitHub published this morning.
+const API = ((process.env.TERMCP_API || '').trim() || 'https://api.github.com').replace(/\/+$/, '');
 const ASSETS = {
   win32: { x64: 'termcp-windows-amd64.exe', arm64: 'termcp-windows-arm64.exe' },
   darwin: { x64: 'termcp-darwin-amd64', arm64: 'termcp-darwin-arm64' },
@@ -55,8 +78,20 @@ const PROBE_BYTES = 524288;     // ...capped at this many bytes
 const FAST_BYTES = 204800;      // first source to reach this wins, no waiting
 const STALL_MS = 15000;         // no bytes for this long -> give up on this source
 
-const die = (msg) => { console.error(`termcp: ${msg}`); process.exit(1); };
-const log = (step, message) => console.error(`termcp: [${step}] ${message}`);
+// `die` reports and stops the run without calling `process.exit`: exiting while
+// an in-flight fetch closes its handle trips a libuv assertion on Windows (the
+// message prints, then the process aborts with 0xC0000409 instead of exiting 1).
+// Throwing a sentinel unwinds to the top-level catch, and the process ends on its
+// own — immediately, since by then the fetch is done.
+class Stop extends Error {}
+const die = (msg) => {
+  try { fs.writeSync(2, `termcp: ${msg}\n`); } catch {}
+  process.exitCode = 1;
+  throw new Stop(msg);
+};
+const log = (step, message) => {
+  try { fs.writeSync(2, `termcp: [${step}] ${message}\n`); } catch {}
+};
 const mbps = (bps) => (bps >= 1048576 ? `${(bps / 1048576).toFixed(1)} MB/s` : `${Math.round(bps / 1024)} KB/s`);
 function sourceName(url) {
   if (url.startsWith(`https://github.com/${REPO}/releases/`)) return 'GitHub';
@@ -102,27 +137,130 @@ function rememberVersion(tag) {
   process.env.TERMCP_VERSION = tag; // so anything we spawn sees the same pin
 }
 
-// Official metadata for one release: tag, and this asset's sha256 digest and
-// size. `version` pins a release; without it the newest published one is used.
-async function releaseMeta(asset, version) {
-  const slug = version ? `tags/${normalizeTag(version)}` : 'latest';
+// --- the channel -------------------------------------------------------------
+// A channel is a line of releases, and its tags name it, so the list is not
+// closed: `v0.2.8` is stable, `v0.2.9-rc.2` is rc, `v0.3.0-beta.1` is beta,
+// `nightly-20261002` is nightly. Nothing records which one you are on — the tag
+// in .version already says it — and a new line needs no change here.
+function channelOf(tag) {
+  if (!tag) return 'stable';
+  const name = normalizeTag(tag);
+  const key = versionKey(name);
+  if (key) return key.pre.length ? key.pre[0].toLowerCase() : 'stable';
+  const word = /^([A-Za-z][A-Za-z0-9]*)(?:[-_.].*)?$/.exec(name);
+  return word ? word[1].toLowerCase() : 'stable';
+}
+
+// One GitHub API call. `ok: false` with status 0 means the network failed; any
+// other status is the API answering (404 = no such release).
+async function apiJSON(pathname) {
   try {
-    const res = await fetch(`https://api.github.com/repos/${REPO}/releases/${slug}`, {
+    const res = await fetch(`${API}/repos/${REPO}/${pathname}`, {
       headers: { 'User-Agent': 'termcp-npm' },
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return { offline: true };
-    const release = await res.json();
-    const found = (release.assets || []).find((a) => a.name === asset);
-    const [algo, hex] = String((found && found.digest) || '').split(':');
-    return {
-      tag: release.tag_name,
-      sha256: algo === 'sha256' && /^[0-9a-f]{64}$/.test(hex) ? hex : null,
-      size: (found && found.size) || 0,
-    };
+    if (!res.ok) return { ok: false, status: res.status };
+    return { ok: true, body: await res.json() };
   } catch {
-    return { offline: true };
+    return { ok: false, status: 0 };
   }
+}
+
+// One release's metadata for this asset: tag, sha256 digest, size.
+function assetDigest(release, asset) {
+  const found = (release.assets || []).find((a) => a.name === asset);
+  const [algo, hex] = String((found && found.digest) || '').split(':');
+  return {
+    tag: release.tag_name,
+    sha256: algo === 'sha256' && /^[0-9a-f]{64}$/.test(hex) ? hex : null,
+    size: (found && found.size) || 0,
+  };
+}
+
+// Official metadata for one release.
+async function releaseMeta(asset, tag) {
+  const r = await apiJSON(`releases/tags/${normalizeTag(tag)}`);
+  if (!r.ok) return { offline: true, status: r.status };
+  return assetDigest(r.body, asset);
+}
+
+// vX.Y.Z with the pre-release identifiers split out, or null for a tag that is
+// not a version at all (`nightly-20261002`, a dev build, a branch name).
+function versionKey(tag) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(String(tag).trim());
+  if (!m) return null;
+  return { core: [+m[1], +m[2], +m[3]], pre: m[4] ? m[4].split('.') : [] };
+}
+
+// Semver order between two tags versionKey accepted. The numeric triple first,
+// then the pre-release identifiers: a version without one is newest (v0.2.8 >
+// v0.2.8-rc.4), and identifiers compare numerically when both are numbers, so
+// rc.9 < rc.10 — string comparison gets that backwards.
+function compareTags(a, b) {
+  const x = versionKey(a);
+  const y = versionKey(b);
+  for (let i = 0; i < 3; i++) if (x.core[i] !== y.core[i]) return x.core[i] < y.core[i] ? -1 : 1;
+  // A version without a pre-release is newer than any of its own pre-releases:
+  // v0.2.8 > v0.2.8-rc.10.
+  if (!x.pre.length || !y.pre.length) {
+    if (x.pre.length === y.pre.length) return 0;
+    return x.pre.length ? -1 : 1;
+  }
+  for (let i = 0; i < Math.min(x.pre.length, y.pre.length); i++) {
+    const p = x.pre[i];
+    const q = y.pre[i];
+    if (p === q) continue;
+    const pn = /^\d+$/.test(p);
+    const qn = /^\d+$/.test(q);
+    if (pn && qn) return Number(p) < Number(q) ? -1 : 1;
+    if (pn !== qn) return pn ? -1 : 1; // a numeric identifier sorts before an alphanumeric one
+    return p < q ? -1 : 1;
+  }
+  if (x.pre.length === y.pre.length) return 0;
+  return x.pre.length < y.pre.length ? -1 : 1;
+}
+
+// Order within one line: version-shaped tags compare as versions (rc.9 < rc.10),
+// anything else as a string, which is exactly what a dated `nightly-20261002`
+// means.
+// ponytail: one page of 100 releases is the window these tags are read from; a
+// line that has not published in 100 releases reads as empty. Paginate if such a
+// line ever needs resolving.
+function compareTagNames(a, b) {
+  if (versionKey(a) && versionKey(b)) return compareTags(a, b);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// The newest release on a channel, with its digest. A pre-release line also
+// carries the final it was testing — once `v0.2.8` ships, someone on
+// `v0.2.8-rc.4` has nothing left to test — so the line is its own tags plus the
+// plain release of the same version. Comparing the candidates as versions is what
+// makes the final outrank its own rcs, and a hotfix on an older line cannot win
+// by being published later.
+// ponytail: promotion matches the numeric triple only. That covers the rc of the
+// version being tested, which is the case that happens.
+async function channelMeta(asset, channel) {
+  const r = await apiJSON('releases?per_page=100');
+  if (!r.ok) return { offline: true, status: r.status };
+  const list = (Array.isArray(r.body) ? r.body : []).filter((rel) => rel && !rel.draft && rel.tag_name);
+  const tested = new Set(list
+    .filter((rel) => channelOf(rel.tag_name) === channel)
+    .map((rel) => versionKey(rel.tag_name))
+    .filter(Boolean)
+    .map((key) => key.core.join('.')));
+  let pick = null;
+  for (const rel of list) {
+    const key = versionKey(rel.tag_name);
+    const onLine = channelOf(rel.tag_name) === channel
+      || (key && !key.pre.length && tested.has(key.core.join('.')));
+    if (!onLine) continue;
+    if (!pick || compareTagNames(rel.tag_name, pick.tag_name) > 0) pick = rel;
+  }
+  if (!pick) {
+    // Nothing on that line: the lines that do exist are what the answer can be.
+    return { empty: true, lines: [...new Set(list.map((rel) => channelOf(rel.tag_name)))].sort() };
+  }
+  return assetDigest(pick, asset);
 }
 
 // Measure one source: ranged GET, bytes streamed into its own temp file so the
@@ -232,10 +370,13 @@ async function resume(url, part, total) {
   }
 }
 
-// Verify what landed against the official digest, then move it into place.
+// Verify what landed against the official digest, then move it into place. The
+// digest is known before the first byte is fetched unless TERMCP_SKIP_VERIFY
+// allowed the download through; a digest that disagrees with the bytes is always
+// a failure, because that is corruption, not a missing check.
 async function verify(part, dest, sha256, total) {
-  const size = fs.statSync(part).size;
-  if (total && size !== total) throw new Error(`incomplete: ${size}/${total} bytes`);
+  const landed = fs.statSync(part).size;
+  if (total && landed !== total) throw new Error(`incomplete: ${landed}/${total} bytes`);
   if (sha256) {
     const hash = crypto.createHash('sha256');
     await new Promise((resolve, reject) => {
@@ -264,10 +405,20 @@ function installedTags() {
   }
 }
 
-// Which version to run: the pin, else what we last resolved, else the newest
-// release. `remember` says the tag came from GitHub and belongs in .version — a
-// pin is never written there.
-async function resolveVersion(asset) {
+// Which version to run: the `use` target, else the pin, else what we last
+// resolved, else the newest release on the line .version is already on (or the
+// one --channel named for this run). `remember` says the tag came from GitHub and
+// belongs in .version — a pin and a `use` target are never written there here, so
+// the caller decides.
+async function resolveVersion(asset, forceTag, channel) {
+  // `use <tag>` is an argument typed on the spot, so it outranks an ambient
+  // TERMCP_VERSION pin. It outranks the remembered version for the same reason.
+  if (forceTag) {
+    const tag = normalizeTag(forceTag);
+    log('version', `installing requested release ${tag}`);
+    return { tag, remember: false, meta: null };
+  }
+
   const requested = (process.env.TERMCP_VERSION || '').trim();
   if (requested && requested !== 'latest') {
     const tag = normalizeTag(requested);
@@ -284,12 +435,20 @@ async function resolveVersion(asset) {
     }
   }
 
-  // No pin, or an explicit `latest`: ask GitHub for the newest release.
-  log('version', 'checking GitHub for the latest release');
-  const meta = await releaseMeta(asset);
+  // No pin, or an explicit `latest`: ask GitHub for the newest release on the
+  // line this is already on — or the one --channel names for this run.
+  const line = channel || channelOf(readVersionFile());
+  log('version', line === 'stable'
+    ? 'checking GitHub for the latest release'
+    : `checking GitHub for the latest ${line} release`);
+  const meta = await channelMeta(asset, line);
   if (meta.tag) {
-    log('version', `latest release is ${meta.tag}`);
+    log('version', `latest ${line} release is ${meta.tag}`);
     return { tag: meta.tag, remember: true, meta };
+  }
+  if (meta.empty) {
+    const lines = meta.lines.length ? `; published lines: ${meta.lines.join(', ')}` : '';
+    die(`no release is published on the ${line} channel${lines}`);
   }
 
   // Offline. Stay on something already here instead of failing: the remembered
@@ -320,7 +479,12 @@ function onPath() {
 }
 
 // Resolve the binary, downloading the release asset on first use.
-async function binary() {
+//
+// forceTag makes the answer exactly that tag: `use <tag>` means "make this one
+// current now", and silently falling back to the remembered version would
+// report a switch that never happened. `channel` names the line for this run,
+// and is undefined for a launch, which then reads it off .version.
+async function binary(forceTag, channel) {
   if (process.env.TERMCP_BIN) {
     log('binary', 'using TERMCP_BIN override');
     return process.env.TERMCP_BIN;
@@ -339,7 +503,7 @@ async function binary() {
   }
 
   const asset = assetName();
-  const { tag, remember, meta: initial } = await resolveVersion(asset);
+  const { tag, remember, meta: initial } = await resolveVersion(asset, forceTag, channel);
   const dest = binaryPath(tag);
   if (fs.existsSync(dest)) {
     // Already installed: no version check, no network. Still record the tag when
@@ -350,13 +514,25 @@ async function binary() {
     return dest;
   }
 
-  // Need the release's digest (and size) before fetching bytes.
+  // Need the release's digest (and size) before fetching bytes. Without the
+  // digest there is nothing to check the bytes against, and a mirror is exactly
+  // the party that could hand over something else — so the download is refused
+  // rather than installed on trust, unless TERMCP_SKIP_VERIFY asks for it.
   if (!(initial && initial.tag)) log('metadata', `checking release ${tag} for ${asset}`);
   const meta = initial && initial.tag ? initial : await releaseMeta(asset, tag);
+  if (meta.offline && meta.status === 404) {
+    die(`no such release: ${tag} (run \`termcp use latest\` to move to the newest on this line)`);
+  }
   if (meta.offline) {
-    log('metadata', `GitHub API unreachable; ${tag} cannot be checksum-verified`);
+    if (!SKIP_VERIFY) {
+      die(`cannot verify ${tag}: the GitHub API is unreachable, so there is no SHA-256 to check against (TERMCP_SKIP_VERIFY=1 installs unchecked)`);
+    }
+    log('metadata', `GitHub API unreachable and TERMCP_SKIP_VERIFY is set; installing ${tag} unchecked`);
   } else if (!meta.sha256) {
-    log('metadata', `no SHA-256 digest for ${asset} in ${tag}; download cannot be checksum-verified`);
+    if (!SKIP_VERIFY) {
+      die(`cannot verify ${tag}: no SHA-256 digest is published for ${asset} (TERMCP_SKIP_VERIFY=1 installs unchecked)`);
+    }
+    log('metadata', `no SHA-256 digest for ${asset} and TERMCP_SKIP_VERIFY is set; installing ${tag} unchecked`);
   } else {
     log('metadata', `SHA-256 available for ${asset}${meta.size ? ` (${(meta.size / 1048576).toFixed(1)} MB)` : ''}`);
   }
@@ -384,7 +560,7 @@ async function binary() {
         const have = await resume(r.url, part, size);
         if (size && have < size) throw new Error(`source stopped early: ${have}/${size} bytes`);
         log('download', `received ${(have / 1048576).toFixed(1)} MB`);
-        log('verify', sha256 ? 'checking file size and SHA-256' : size ? 'checking file size (SHA-256 unavailable)' : 'no published size or SHA-256 to check');
+        log('verify', sha256 ? 'checking file size and SHA-256' : 'checking file size only (TERMCP_SKIP_VERIFY)');
         await verify(part, dest, sha256, size);
         log('install', `installed ${tag} for ${process.platform}/${process.arch}`);
         if (remember) rememberVersion(tag);
@@ -400,15 +576,97 @@ async function binary() {
   }
 }
 
+// The wrapper's own command-line surface, taken off argv before anything else
+// sees it. --channel is the only flag it owns, and both spellings are accepted:
+// `--channel=rc` cannot swallow the next word by accident.
+// The verb is only a verb when it leads: a positional argument must lead the
+// binary too (its own parser takes the subcommand off the front), so there is no
+// other place `use` could mean anything.
+function takeWrapperArgs(argv) {
+  const rest = [];
+  let channel = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--channel') {
+      channel = String(argv[++i] == null ? '' : argv[i]);
+      continue;
+    }
+    if (arg.startsWith('--channel=')) {
+      channel = arg.slice('--channel='.length);
+      continue;
+    }
+    rest.push(arg);
+  }
+  const verb = rest[0] === 'use' ? rest[0] : null;
+  return { argv: rest, verb, tag: verb ? rest[1] : null, channel };
+}
+
+// `use <tag>|latest [--channel C]`: make that release the one launches run, then
+// exit — the binary is never started, this is the installer. Every version lands
+// in versions/<tag>/, so picking one that is already there is an instant, offline
+// switch; that is also how a downgrade works. Nothing is written about the
+// channel: --channel decides this one resolution and is then forgotten.
+// A bare `use` with no arguments shows what is running and how to move.
+async function runUse({ tag, channel }) {
+  if (channel !== null) channel = channel.trim().toLowerCase();
+  if (tag && tag.startsWith('-')) die(`use takes a version or --channel, not ${tag}`);
+  if (!tag && channel === null) {
+    const current = readVersionFile();
+    const line = channelOf(current);
+    if (!current) {
+      console.log('termcp is not installed yet (run `termcp use latest`)');
+    } else {
+      console.log(`termcp ${current} (channel ${line})`);
+    }
+    console.log('usage: termcp use <tag> | termcp use latest | termcp use --channel <name>');
+    return;
+  }
+  if (process.env.TERMCP_BIN) die('TERMCP_BIN is set; use does not apply to an externally supplied binary');
+  if (process.env.TERMCP_SKIP_DOWNLOAD) die('TERMCP_SKIP_DOWNLOAD is set; use would download nothing');
+  if (channel !== null) log('channel', `resolving on the ${channel} line`);
+  const explicit = !!tag && tag !== 'latest';
+  // No tag means "the newest one on the channel", which is exactly what
+  // TERMCP_VERSION=latest asks for; without this the resolver would answer with
+  // the remembered version and report a switch it never made.
+  if (!explicit) process.env.TERMCP_VERSION = 'latest';
+  // A Stop from inside `binary` is already reported; anything else is a real
+  // failure worth printing once.
+  const bin = await binary(explicit ? tag : null, channel).catch((e) => {
+    if (e instanceof Stop) throw e;
+    die(e.message);
+  });
+  // An explicit tag is deliberately NOT remembered by binary(), so `use` — which
+  // means "make this the version termcp runs from now on" — records it here.
+  // The no-tag path goes through rememberVersion() inside binary().
+  const installed = path.basename(path.dirname(bin));
+  if (explicit) rememberVersion(installed);
+  console.log(`termcp ${installed} ready at ${bin} (channel ${channel || channelOf(installed)})`);
+  console.log('restart any running termcp instance to use it');
+}
+
 (async () => {
-  const bin = await binary();
+  const { argv, verb, tag, channel } = takeWrapperArgs(process.argv.slice(2));
+  if (verb) return runUse({ tag, channel });
+  // The binary's own parser would answer a stray `update` with a directive error
+  // nobody can act on; the word people mean is `use latest`.
+  if (argv[0] === 'update') die('`update` is not a command; use `termcp use latest`');
+  if (channel !== null) die('--channel only applies to `termcp use --channel …`');
+
+  // Installing here can take seconds, and a client impatient enough to kill this
+  // process mid-download loses nothing: the bytes land in a .part file and
+  // .version is only rewritten once the checksum verified, so the next launch
+  // resumes or re-fetches and no half-installed version is ever run.
+  const bin = await binary(null, null);
   log('launch', 'starting termcp');
   // The depth marker stops a PATH lookup from re-entering this wrapper.
   const depth = String((Number(process.env.TERMCP_WRAPPER_DEPTH) || 0) + 1);
-  const child = spawn(bin, process.argv.slice(2), {
+  const child = spawn(bin, argv, {
     stdio: 'inherit',
     env: Object.assign({}, process.env, { TERMCP_WRAPPER_DEPTH: depth }),
   });
-  child.on('error', (e) => die(`cannot run ${bin}: ${e.message}`));
+  child.on('error', (e) => { try { die(`cannot run ${bin}: ${e.message}`); } catch {} });
   process.exitCode = await new Promise((r) => child.on('exit', (code, sig) => r(code == null ? (sig ? 1 : 0) : code)));
-})().catch((e) => die(e.message));
+})().catch((e) => {
+  if (e instanceof Stop) return; // already reported, and the exit code is set
+  try { die(e.message); } catch {}
+});
