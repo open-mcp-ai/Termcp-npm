@@ -42,6 +42,7 @@ claude mcp add termcp -- npx -y @open-mcp-ai/termcp daemon stdio
 | `TERMCP_SKIP_DOWNLOAD` | Never download; use `TERMCP_BIN` or whatever `termcp` is on `PATH`.    |
 | `TERMCP_API`           | GitHub API base (default `https://api.github.com`); for a mirror or a test server. |
 | `TERMCP_SKIP_VERIFY`   | Install a release that publishes no SHA-256 digest. A digest that disagrees with the bytes still fails. |
+| `TERMCP_CACHE_MINUTES` | How long `termcp list` reuses a fetched release list (default 10; `0` asks GitHub every time). |
 
 ## Channels and switching versions
 
@@ -49,19 +50,38 @@ termcp never checks for updates on its own: a regular launch reads
 `~/.termcp/.version` and touches no network. When you want to move:
 
 ```bash
-# Switch version
+termcp list                   # the newest release on each line
 termcp use latest             # newest release on the line .version is already on
 termcp use <tag>              # one specific release — downgrade, upgrade, or pinned
 termcp use --channel rc       # move onto the rc line and switch to its newest
-termcp use --channel nightly  # move onto the rolling nightly line
 
-# Update and restart a running daemon in one go
-termcp use latest && termcp daemon stop
+# Update and stop the running instance in one go
+termcp use latest && termcp kill
 ```
 
-`use` only writes `.version`, so an instance already serving keeps the old binary;
-`daemon stop` ends it, and whatever starts termcp next (`termcp`, an MCP client, the Web UI)
-picks up the new one.
+`use` only writes `.version`, so an instance already serving keeps the old binary.
+`kill` ends the background daemon (a manually started instance is left alone);
+whatever connects next starts the selected release.
+
+## MCP tool for an agent
+
+`--mcp` serves the same commands over stdio as one tool, `termcp`, so an agent can
+move termcp between versions itself. Nothing is launched and no binary is needed
+for status:
+
+```json
+{
+  "mcpServers": {
+    "termcp-versions": {
+      "command": "npx",
+      "args": ["-y", "@open-mcp-ai/termcp", "--mcp"]
+    }
+  }
+}
+```
+
+The tool takes one argument, `cmd`: empty for status, or a command from the list
+above (`list`, `use <tag>|latest [--channel <name>]`, `kill`).
 
 
 ## Uninstall

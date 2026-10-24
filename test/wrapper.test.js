@@ -139,6 +139,53 @@ function releasesAPI(getReleases) {
   return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ srv, url: `http://127.0.0.1:${srv.address().port}` })));
 }
 
+// A minimal MCP client: newline-delimited frames out, replies matched by id. A
+// line that is not a reply is collected as stray — stdout is the protocol, and
+// anything else on it is a bug.
+function mcpClient(dir, env = {}) {
+  const child = spawn(process.execPath, [WRAPPER, '--mcp'], {
+    env: Object.assign({}, process.env, { TERMCP_DATA_DIR: dir, TERMCP_BIN: '', TERMCP_SKIP_DOWNLOAD: '' }, env),
+  });
+  const waiting = new Map();
+  const stray = [];
+  let buffer = '';
+  let id = 0;
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  child.stdout.on('data', (d) => {
+    buffer += d;
+    let nl;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 1);
+      if (!line.trim()) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { stray.push(line); continue; }
+      if (msg.id != null && waiting.has(msg.id)) {
+        const done = waiting.get(msg.id);
+        waiting.delete(msg.id);
+        done(msg);
+      } else {
+        stray.push(line);
+      }
+    }
+  });
+  const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const mine = ++id;
+    waiting.set(mine, resolve);
+    send({ jsonrpc: '2.0', id: mine, method, params });
+    setTimeout(() => { if (waiting.delete(mine)) reject(new Error(`no reply to ${method}; stderr: ${stderr}`)); }, 60000);
+  });
+  return {
+    request,
+    notify: (method, params) => send({ jsonrpc: '2.0', method, params }),
+    stray,
+    stderr: () => stderr,
+    close: () => new Promise((r) => { child.stdin.end(); child.on('close', (code) => r(code)); }),
+  };
+}
+
 (async () => {
   // 1. passthrough — installs latest if nothing is cached yet.
   {
@@ -388,6 +435,26 @@ function releasesAPI(getReleases) {
     assert.match(empty.stderr, /no release is published on the nightly channel/, 'expected a clear message: ' + empty.stderr);
     console.log('ok: missing channel, missing release and stray flag all refused');
 
+    // The command line carries the same words the tool does, so `list` is a
+    // command here too, not something only an agent can reach. .version is on the
+    // rc line, so that is the line the list must mark.
+    releases = [rel('v9.0.2'), rel('v9.0.3-rc.1', true)];
+    const listed = await run(['list']);
+    assert.equal(listed.status, 0, 'list must work from the command line: ' + listed.stderr);
+    assert.match(listed.stdout, /stable\s+v9\.0\.2/, 'list must name each line: ' + listed.stdout);
+    assert.match(listed.stdout, /rc\s+v9\.0\.3-rc\.1\s+<- current line/, 'list must mark the line .version is on: ' + listed.stdout);
+    assert.ok(!/\[probe\]|\[download\]/.test(listed.stderr), 'list must never download: ' + listed.stderr);
+    // `kill` is the binary's `daemon stop`, and only `use` reads --channel: a
+    // stray flag is refused before anything is spawned.
+    const strayKill = await run(['kill', '--channel', 'rc']);
+    assert.notEqual(strayKill.status, 0, 'kill must refuse --channel');
+    assert.match(strayKill.stderr, /only applies to/, 'expected the pointer to `use`: ' + strayKill.stderr);
+    // MCP mode takes no release: the version is named inside the tool call.
+    const strayMcp = await run(['--mcp', 'v9.0.1']);
+    assert.notEqual(strayMcp.status, 0, '--mcp must refuse a release argument');
+    assert.match(strayMcp.stderr, /takes no release/, 'expected the pointer to the tool call: ' + strayMcp.stderr);
+    console.log('ok: `list` runs from the command line, and stray flags are refused');
+
     api.srv.close();
   // 12. No digest, no install. A mirror is the party that could hand over
   // something else, so bytes that cannot be checked against the official digest
@@ -425,6 +492,93 @@ function releasesAPI(getReleases) {
     fs.rmSync(dir, { recursive: true, force: true });
     console.log('ok: a release with no published digest is refused, not installed');
   }
+
+    asset.srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // 13. The wrapper's own MCP tool (`--mcp`): ONE tool whose `cmd` is a word from
+  // the command line, so what an agent learns is what a person types. stdout
+  // carries frames and nothing else, a refused command comes back as a tool error
+  // instead of ending the server, and `list` is remembered so a polling agent
+  // cannot spend GitHub's 60 requests an hour.
+  {
+    const dir = path.join(os.tmpdir(), `termcp-mcp-${process.pid}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+    const body = Buffer.from('termcp fake release\n'.repeat(64));
+    const rel = (tag, prerelease = false) => ({
+      tag_name: tag,
+      draft: false,
+      prerelease,
+      assets: [{ name: ASSET, size: body.length, digest: `sha256:${sha(body)}` }],
+    });
+    const releases = [rel('v9.0.2'), rel('v9.0.2-rc.10', true), rel('nightly-20261002', true)];
+    let apiCalls = 0;
+    const api = await releasesAPI(() => { apiCalls++; return releases; });
+    const asset = await mirror(body, { tag: 'fake' });
+    const mcp = mcpClient(dir, { TERMCP_API: api.url, TERMCP_MIRROR: asset.url });
+    const call = (cmd) => mcp.request('tools/call', { name: 'termcp', arguments: cmd === undefined ? {} : { cmd } });
+    const text = (res) => res.result.content[0].text;
+
+    const init = await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
+    assert.equal(init.result.protocolVersion, '2025-06-18', 'the client’s protocol version must come back');
+    mcp.notify('notifications/initialized');
+    const tools = await mcp.request('tools/list');
+    assert.equal(tools.result.tools.length, 1, 'one tool, not a pile: ' + JSON.stringify(tools.result.tools.map((t) => t.name)));
+    assert.equal(tools.result.tools[0].name, 'termcp', 'the tool is the thing being managed');
+    console.log('ok: `--mcp` serves one tool, and the handshake answers');
+
+    // Status reads local files: an agent may ask as often as it likes.
+    const before = await call();
+    assert.match(text(before), /current: nothing selected/, 'expected an empty selection: ' + text(before));
+    assert.match(text(before), /commands: status/, 'a bare cmd must name the commands: ' + text(before));
+    assert.equal(apiCalls, 0, 'status must not touch the network: ' + mcp.stderr());
+
+    const listed = await call('list');
+    assert.match(text(listed), /stable\s+v9\.0\.2/, 'list must give each line’s newest tag: ' + text(listed));
+    assert.match(text(listed), /rc\s+v9\.0\.2\s/, 'an rc line carries the final it was testing: ' + text(listed));
+    assert.match(text(listed), /nightly\s+nightly-20261002/, 'a dated line orders as a string: ' + text(listed));
+    assert.match(text(listed), /<- current line/, 'the line in .version must be marked: ' + text(listed));
+    assert.equal(apiCalls, 1, 'list must fetch once');
+    await call('list');
+    assert.equal(apiCalls, 1, 'a second list must come from the cache, not GitHub');
+    assert.ok(fs.existsSync(path.join(dir, '.releases-cache.json')), 'the cache must be a file with a timestamp');
+    console.log('ok: `list` names each line’s newest tag and remembers the answer');
+
+    const used = await call('use latest');
+    assert.ok(!used.result.isError, 'use must succeed: ' + text(used));
+    assert.match(text(used), /termcp v9\.0\.2 ready at/, 'expected the switch report: ' + text(used));
+    assert.equal(fs.readFileSync(path.join(dir, '.version'), 'utf8').trim(), 'v9.0.2', 'the switch must be recorded');
+    assert.equal(apiCalls, 2, 'a switch resolves against a fresh list, not the cache');
+    const moved = await call('use --channel nightly');
+    assert.ok(!moved.result.isError, '--channel must work in the tool: ' + text(moved));
+    assert.equal(fs.readFileSync(path.join(dir, '.version'), 'utf8').trim(), 'nightly-20261002');
+    console.log('ok: the tool switches versions by reusing `use`');
+
+    // A refusal is a tool result, not a dead server.
+    const missing = await call('use v9.9.9');
+    assert.equal(missing.result.isError, true, 'a release nobody published must be a tool error');
+    assert.match(text(missing), /no such release/, 'expected the 404 to say so: ' + text(missing));
+    const bogus = await call('nonsense');
+    assert.equal(bogus.result.isError, true, 'an unknown command must be a tool error');
+    assert.match(text(bogus), /unknown command/, 'expected the command list back: ' + text(bogus));
+    const alive = await mcp.request('ping');
+    assert.ok(alive.result, 'the server must still answer after two refusals');
+    assert.deepEqual(mcp.stray, [], 'stdout must carry frames and nothing else');
+    console.log('ok: a refused command is a tool error, and the server stays up');
+
+    // The cache is spent by the clock, so an exhausted or unreachable API still
+    // has an answer — and TERMCP_CACHE_MINUTES=0 refuses to use it at all.
+    api.srv.close();
+    const cached = await call('list');
+    assert.ok(!cached.result.isError, 'a cached list must outlive the API: ' + text(cached));
+    assert.equal(await mcp.close(), 0, 'stdin closing must end the server with 0');
+    const fresh = mcpClient(dir, { TERMCP_API: api.url, TERMCP_CACHE_MINUTES: '0' });
+    const gone = await fresh.request('tools/call', { name: 'termcp', arguments: { cmd: 'list' } });
+    assert.equal(gone.result.isError, true, 'with caching off and no API, list must fail');
+    assert.match(gone.result.content[0].text, /unreachable|answered/, 'expected a clear reason: ' + gone.result.content[0].text);
+    assert.equal(await fresh.close(), 0, 'a refusal must not become the exit code');
+    console.log('ok: the cached list is reused, and TERMCP_CACHE_MINUTES=0 bypasses it');
 
     asset.srv.close();
     fs.rmSync(dir, { recursive: true, force: true });

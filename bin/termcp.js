@@ -15,12 +15,22 @@
 // bytes come from whichever source measures fastest — mirrors included. The
 // final sha256 is what makes a mirror untrusted-but-usable.
 //
-// One command-line word belongs to this wrapper and never reaches the binary:
+// Four words belong to this wrapper and never reach the binary:
 //   use <tag>|latest [--channel <name>]
 //                  make that release the one launches run, then exit. `latest`
 //                  means the newest release on the line .version is already on;
 //                  --channel moves to another line for that one command; a tag
 //                  is any release, newer or older.
+//   --mcp          serve this wrapper's own MCP tool on stdio and launch
+//                  nothing. ONE tool, `termcp`, whose `cmd` argument is a word
+//                  from that same surface — status, list, use …, kill — so the
+//                  command line stays the only vocabulary there is to learn.
+//   kill [flags]   stop the running instance: the binary's own `daemon stop`,
+//                  which ends a background daemon and leaves a manually started
+//                  instance alone. Whatever connects next starts the release
+//                  .version selects, so this is how a switch takes effect.
+//   list           the newest release on each line, with the tag a switch would
+//                  land on. Remembered for a few minutes (TERMCP_CACHE_MINUTES).
 // A line is named by its tags (`v0.2.8` stable, `v0.2.8-rc.1` rc, `v0.3.0-beta.2`
 // beta, `nightly-20261002` nightly), so no channel is hard-coded here and a new
 // line needs no change.
@@ -34,11 +44,13 @@
 //      TERMCP_DATA_DIR (termcp's data directory; defaults to ~/.termcp),
 //      TERMCP_SKIP_DOWNLOAD, TERMCP_API (GitHub API base; defaults to
 //      https://api.github.com), TERMCP_SKIP_VERIFY (install a release that has
-//      no digest to check against).
+//      no digest to check against), TERMCP_CACHE_MINUTES (how long `list`
+//      reuses a fetched release list; 0 asks GitHub every time).
 //
 // Cache location: the data directory itself, exactly as termcp resolves it
 // (config.DefaultDataDir) — $TERMCP_DATA_DIR when set, else ~/.termcp. The
-// wrapper adds only `versions/<version>/termcp` and `.version` inside it, so
+// wrapper adds only `versions/<version>/termcp`, `.version` and
+// `.releases-cache.json` inside it, so
 // `TERMCP_DATA_DIR=/opt/termcp termcp ...` moves both.
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
@@ -53,6 +65,7 @@ const DATA_DIR = (process.env.TERMCP_DATA_DIR || '').trim() || path.join(os.home
 const SKIP_VERIFY = !!process.env.TERMCP_SKIP_VERIFY;
 const VERSIONS_DIR = path.join(DATA_DIR, 'versions');
 const VERSION_FILE = path.join(DATA_DIR, '.version');
+const CACHE_FILE = path.join(DATA_DIR, '.releases-cache.json');
 const REPO = 'open-mcp-ai/termcp';
 // GitHub API base. TERMCP_API exists so the channel resolution can be tested
 // against a local server instead of whatever GitHub published this morning.
@@ -152,12 +165,14 @@ function channelOf(tag) {
 }
 
 // One GitHub API call. `ok: false` with status 0 means the network failed; any
-// other status is the API answering (404 = no such release).
+// other status is the API answering (404 = no such release). The timeout is sized
+// for the biggest reply here — `releases?per_page=100` is a few hundred KB, and 8s
+// was short enough that a slow link read as "GitHub is unreachable".
 async function apiJSON(pathname) {
   try {
     const res = await fetch(`${API}/repos/${REPO}/${pathname}`, {
       headers: { 'User-Agent': 'termcp-npm' },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) return { ok: false, status: res.status };
     return { ok: true, body: await res.json() };
@@ -231,18 +246,26 @@ function compareTagNames(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-// The newest release on a channel, with its digest. A pre-release line also
-// carries the final it was testing — once `v0.2.8` ships, someone on
+// One page of the release list, drafts dropped. Every channel question is this
+// one request, which is why `list` remembers it.
+// ponytail: one page of 100 releases is the window these tags are read from; a
+// line that has not published in 100 releases reads as empty. Paginate if such a
+// line ever needs resolving.
+async function fetchReleases() {
+  const r = await apiJSON('releases?per_page=100');
+  if (!r.ok) return { ok: false, status: r.status };
+  return { ok: true, list: (Array.isArray(r.body) ? r.body : []).filter((rel) => rel && !rel.draft && rel.tag_name) };
+}
+
+// The newest release on one line, out of a list already in hand. A pre-release
+// line also carries the final it was testing — once `v0.2.8` ships, someone on
 // `v0.2.8-rc.4` has nothing left to test — so the line is its own tags plus the
 // plain release of the same version. Comparing the candidates as versions is what
 // makes the final outrank its own rcs, and a hotfix on an older line cannot win
 // by being published later.
 // ponytail: promotion matches the numeric triple only. That covers the rc of the
 // version being tested, which is the case that happens.
-async function channelMeta(asset, channel) {
-  const r = await apiJSON('releases?per_page=100');
-  if (!r.ok) return { offline: true, status: r.status };
-  const list = (Array.isArray(r.body) ? r.body : []).filter((rel) => rel && !rel.draft && rel.tag_name);
+function pickOnLine(list, asset, channel) {
   const tested = new Set(list
     .filter((rel) => channelOf(rel.tag_name) === channel)
     .map((rel) => versionKey(rel.tag_name))
@@ -261,6 +284,40 @@ async function channelMeta(asset, channel) {
     return { empty: true, lines: [...new Set(list.map((rel) => channelOf(rel.tag_name)))].sort() };
   }
   return assetDigest(pick, asset);
+}
+
+// The newest release on a channel, with its digest. A switch resolves against a
+// fresh list: a stale answer here would report a move that never happened.
+async function channelMeta(asset, channel) {
+  const r = await fetchReleases();
+  if (!r.ok) return { offline: true, status: r.status };
+  return pickOnLine(r.list, asset, channel);
+}
+
+// The same list, remembered for a few minutes. Only `list` reads it: that is the
+// call an agent makes over and over, and GitHub answers 60 unauthenticated
+// requests an hour per IP — a polling agent spends that in minutes.
+function cacheTTL() {
+  const minutes = Number(process.env.TERMCP_CACHE_MINUTES);
+  return (Number.isFinite(minutes) ? Math.max(0, minutes) : 10) * 60000;
+}
+async function cachedReleases() {
+  const ttl = cacheTTL();
+  if (ttl > 0) {
+    try {
+      const hit = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+      if (Array.isArray(hit.list) && Date.now() - hit.at < ttl) return { ok: true, list: hit.list, at: hit.at };
+    } catch {}
+  }
+  const r = await fetchReleases();
+  if (!r.ok) return r;
+  if (ttl > 0) {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(CACHE_FILE, JSON.stringify({ at: Date.now(), list: r.list }));
+    } catch {}
+  }
+  return { ok: true, list: r.list, at: Date.now() };
 }
 
 // Measure one source: ranged GET, bytes streamed into its own temp file so the
@@ -456,7 +513,10 @@ async function resolveVersion(asset, forceTag, channel) {
   // fetch a release we have never seen, and that cannot work right now anyway.
   const fallback = readVersionFile() || installedTags()[0];
   if (fallback) {
-    log('version', `GitHub unreachable, staying on ${normalizeTag(fallback)}`);
+    // A status means the API answered and refused (its 60/hour, usually) — a
+    // different problem from no network, and worth saying which one it is.
+    const why = meta.status ? `GitHub answered ${meta.status}` : 'GitHub unreachable';
+    log('version', `${why}, staying on ${normalizeTag(fallback)}`);
     return { tag: normalizeTag(fallback), remember: false, meta: { offline: true } };
   }
   die('GitHub is unreachable and no termcp version is installed; set TERMCP_VERSION to a release you can fetch');
@@ -577,14 +637,15 @@ async function binary(forceTag, channel) {
 }
 
 // The wrapper's own command-line surface, taken off argv before anything else
-// sees it. --channel is the only flag it owns, and both spellings are accepted:
-// `--channel=rc` cannot swallow the next word by accident.
+// sees it. --channel and --mcp are the only flags it owns, and both spellings of
+// --channel are accepted: `--channel=rc` cannot swallow the next word by accident.
 // The verb is only a verb when it leads: a positional argument must lead the
 // binary too (its own parser takes the subcommand off the front), so there is no
 // other place `use` could mean anything.
 function takeWrapperArgs(argv) {
   const rest = [];
   let channel = null;
+  let mcp = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--channel') {
@@ -595,10 +656,14 @@ function takeWrapperArgs(argv) {
       channel = arg.slice('--channel='.length);
       continue;
     }
+    if (arg === '--mcp') {
+      mcp = true;
+      continue;
+    }
     rest.push(arg);
   }
-  const verb = rest[0] === 'use' ? rest[0] : null;
-  return { argv: rest, verb, tag: verb ? rest[1] : null, channel };
+  const verb = ['use', 'kill', 'list'].includes(rest[0]) ? rest[0] : null;
+  return { argv: rest, verb, tag: verb ? rest[1] : null, channel, mcp };
 }
 
 // `use <tag>|latest [--channel C]`: make that release the one launches run, then
@@ -606,20 +671,20 @@ function takeWrapperArgs(argv) {
 // in versions/<tag>/, so picking one that is already there is an instant, offline
 // switch; that is also how a downgrade works. Nothing is written about the
 // channel: --channel decides this one resolution and is then forgotten.
-// A bare `use` with no arguments shows what is running and how to move.
+// A bare `use` with no arguments shows what is selected and how to move.
+//
+// Returns the report instead of printing it, because the same call answers the
+// MCP tool, whose stdout is the protocol and can hold nothing else.
 async function runUse({ tag, channel }) {
   if (channel !== null) channel = channel.trim().toLowerCase();
   if (tag && tag.startsWith('-')) die(`use takes a version or --channel, not ${tag}`);
   if (!tag && channel === null) {
     const current = readVersionFile();
     const line = channelOf(current);
-    if (!current) {
-      console.log('termcp is not installed yet (run `termcp use latest`)');
-    } else {
-      console.log(`termcp ${current} (channel ${line})`);
-    }
-    console.log('usage: termcp use <tag> | termcp use latest | termcp use --channel <name>');
-    return;
+    return (current
+      ? [`termcp ${current} (channel ${line})`]
+      : ['termcp is not installed yet (run `termcp use latest`)'])
+      .concat(['usage: termcp use <tag> | termcp use latest | termcp use --channel <name>']);
   }
   if (process.env.TERMCP_BIN) die('TERMCP_BIN is set; use does not apply to an externally supplied binary');
   if (process.env.TERMCP_SKIP_DOWNLOAD) die('TERMCP_SKIP_DOWNLOAD is set; use would download nothing');
@@ -640,17 +705,220 @@ async function runUse({ tag, channel }) {
   // The no-tag path goes through rememberVersion() inside binary().
   const installed = path.basename(path.dirname(bin));
   if (explicit) rememberVersion(installed);
-  console.log(`termcp ${installed} ready at ${bin} (channel ${channel || channelOf(installed)})`);
-  console.log('restart any running termcp instance to use it');
+  return [
+    `termcp ${installed} ready at ${bin} (channel ${channel || channelOf(installed)})`,
+    'a running instance keeps the old binary until it is stopped and started again',
+  ];
+}
+
+// --- the MCP tool ------------------------------------------------------------
+// `--mcp` serves this wrapper over stdio as ONE tool, `termcp`, whose `cmd`
+// argument is a word from the surface above — so the command line stays the only
+// vocabulary, and the tool list stays one entry long. stdout is the protocol
+// channel: every tool answers with text, every log goes to stderr, and a refused
+// command comes back as isError instead of ending the process.
+const MCP_TOOL = 'termcp';
+const MCP_PROTOCOL = '2025-06-18'; // echoed back when the client does not name one
+const MCP_USAGE = 'commands: status (no cmd) | list | use <tag>|latest [--channel <name>] | kill [daemon flags]';
+const MCP_TOOLS = [{
+  name: MCP_TOOL,
+  description:
+    'Manage which termcp release launches run. cmd takes: nothing (what is selected, which line that is, '
+    + 'and what is installed), `list` (the newest release on each line, from GitHub), `use <tag>|latest '
+    + '[--channel <name>]` (install and select it — a tag may be older, so this downgrades as well as '
+    + 'upgrades), or `kill` (stop the running instance; a client reconnects and starts the selected release).',
+  inputSchema: {
+    type: 'object',
+    properties: { cmd: { type: 'string', description: `Empty for status. ${MCP_USAGE}` } },
+    additionalProperties: false,
+  },
+}];
+
+// What launches run, and what is on disk — read from local files, so an agent may
+// ask as often as it likes without spending a request.
+function statusLines() {
+  const current = readVersionFile();
+  const installed = installedTags();
+  const lines = [];
+  if (!current) {
+    lines.push('current: nothing selected (the next launch installs the newest stable release)');
+  } else {
+    lines.push(`current: ${current} (channel ${channelOf(current)})`);
+    if (!installed.includes(normalizeTag(current))) lines.push(`note: ${current} is not on disk; the next launch installs it`);
+  }
+  lines.push(installed.length ? `installed: ${installed.join(', ')}` : 'installed: none');
+  return lines;
+}
+
+const ageOf = (at) => {
+  const minutes = Math.round((Date.now() - at) / 60000);
+  return minutes < 1 ? 'just fetched' : `fetched ${minutes} min ago`;
+};
+
+// Every line that has published a release, with the tag a switch would land on.
+// Same pickOnLine the switch uses, so the list cannot promise one release and the
+// switch install another.
+async function listLines() {
+  const asset = assetName();
+  const r = await cachedReleases();
+  if (!r.ok) die(r.status ? `GitHub answered ${r.status}; try again later` : 'GitHub is unreachable; try again later');
+  const channels = [...new Set(r.list.map((rel) => channelOf(rel.tag_name)))].sort();
+  if (!channels.length) die('no release is published');
+  const current = channelOf(readVersionFile());
+  const width = Math.max(...channels.map((c) => c.length));
+  const lines = [`newest release on each line (${ageOf(r.at)}):`];
+  for (const channel of channels) {
+    const pick = pickOnLine(r.list, asset, channel);
+    if (!pick.tag) continue;
+    lines.push(`  ${channel.padEnd(width)}  ${pick.tag}${channel === current ? '  <- current line' : ''}`);
+  }
+  lines.push('switch with `use <tag>`, or `use latest` for the newest on the current line');
+  return lines;
+}
+
+// `kill`: the binary's own `daemon stop`, run as a command rather than re-asked
+// over HTTP here — it knows the port, the credential, and the difference between
+// a daemon and a manually started instance, and says so in the same words it
+// would if you typed it. The instance that stops is the one a client is talking
+// to, so the connection drops; reconnecting starts the selected release.
+async function killLines(args) {
+  // The rest of the line belongs to `daemon stop` — its host, port and credential
+  // are the ones that decide which instance is addressed.
+  const { argv: extra, channel } = takeWrapperArgs(args);
+  if (channel !== null) die('--channel only applies to `use --channel …`');
+  const bin = await binary(null, null);
+  const { code, out } = await run(bin, ['daemon', 'stop'].concat(extra));
+  const said = out.trim();
+  if (code !== 0) die(said || `daemon stop exited ${code}`);
+  return [
+    said || 'termcp daemon: no output',
+    `a client that reconnects starts ${readVersionFile() || 'the newest stable release'}`,
+  ];
+}
+
+// Run one command of the surface above and return its lines. Nothing here prints:
+// the CLI prints the lines, the MCP tool returns them as the tool's text.
+async function runCommand(cmd) {
+  const words = String(cmd == null ? '' : cmd).trim().split(/\s+/).filter(Boolean);
+  const verb = words[0] || '';
+  if (!verb) return statusLines().concat(MCP_USAGE);
+  if (verb === 'status') return statusLines();
+  if (verb === 'list') return listLines();
+  if (verb === 'kill') return killLines(words.slice(1));
+  if (verb === 'use') {
+    const { verb: used, tag, channel } = takeWrapperArgs(words);
+    if (used) return runUse({ tag, channel });
+  }
+  die(`unknown command: ${verb} (${MCP_USAGE})`);
+}
+
+// A child's whole output, for the one command whose answer is another process's.
+// spawn can fail synchronously (Windows answers a file that is not an image with
+// EINVAL), so the call itself is guarded, not just the error event.
+function run(bin, args) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      return resolve({ code: 1, out: `cannot run ${bin}: ${e.message}\n` });
+    }
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+    child.on('error', (e) => resolve({ code: 1, out: `${out}cannot run ${bin}: ${e.message}\n` }));
+    child.on('exit', (code) => resolve({ code: code == null ? 1 : code, out }));
+  });
+}
+
+// The stdio loop: newline-delimited JSON-RPC 2.0, no SDK — the handshake, one
+// tool, and nothing else is a dependency this package would pay for on every
+// `npx`. Frames are handled in order (a switch and a kill must not interleave),
+// notifications are never answered, and stdin closing ends the server.
+function serveMcp() {
+  let pkg = { version: '0.0.0' };
+  try { pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')); } catch {}
+  let queue = Promise.resolve(); // one call at a time: a switch and a kill must not interleave
+  const write = (msg) => { try { process.stdout.write(JSON.stringify(msg) + '\n'); } catch {} };
+  const reply = (id, result) => write({ jsonrpc: '2.0', id, result });
+  const fail = (id, code, message) => write({ jsonrpc: '2.0', id, error: { code, message } });
+
+  async function call(id, params) {
+    if (!params || params.name !== MCP_TOOL) return fail(id, -32602, `unknown tool: ${params && params.name}`);
+    const cmd = params.arguments && params.arguments.cmd;
+    if (cmd != null && typeof cmd !== 'string') return fail(id, -32602, 'cmd must be a string');
+    try {
+      reply(id, { content: [{ type: 'text', text: (await runCommand(cmd)).join('\n') }] });
+    } catch (e) {
+      // die() has already written the reason to stderr; the caller gets it as a
+      // tool result, and the server stays up — a refusal is not a crash.
+      reply(id, { content: [{ type: 'text', text: e && e.message ? e.message : String(e) }], isError: true });
+    } finally {
+      process.exitCode = 0; // die() set it for the CLI; this process is still alive
+    }
+  }
+
+  function frame(line) {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return fail(null, -32700, 'parse error'); }
+    const method = msg && msg.method;
+    if (typeof method !== 'string') return fail(msg && msg.id, -32600, 'invalid request');
+    if (msg.id === undefined || msg.id === null) return; // a notification owes no answer
+    const { id } = msg;
+    if (method === 'initialize') {
+      return reply(id, {
+        protocolVersion: (msg.params && msg.params.protocolVersion) || MCP_PROTOCOL,
+        capabilities: { tools: {} },
+        serverInfo: { name: 'termcp-wrapper', version: pkg.version },
+      });
+    }
+    if (method === 'ping') return reply(id, {});
+    if (method === 'tools/list') return reply(id, { tools: MCP_TOOLS });
+    if (method === 'tools/call') { queue = queue.then(() => call(id, msg.params)).catch(() => {}); return; }
+    return fail(id, -32601, `method not found: ${method}`);
+  }
+
+  let buffer = '';
+  log('mcp', 'serving the termcp tool on stdio');
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    let nl;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (line) frame(line);
+    }
+  });
 }
 
 (async () => {
-  const { argv, verb, tag, channel } = takeWrapperArgs(process.argv.slice(2));
-  if (verb) return runUse({ tag, channel });
+  const { argv, verb, tag, channel, mcp } = takeWrapperArgs(process.argv.slice(2));
+  // MCP mode serves the tool and launches nothing, so a release named beside it
+  // is an argument no door reads. A leading `use` is tolerated: it is how the
+  // flag gets typed when the tool is thought of as `use` over MCP.
+  if (mcp) {
+    if (argv.some((w) => w !== 'use')) die('--mcp takes no release; name it in the tool call (`use <tag>`)');
+    return serveMcp();
+  }
+  if (verb === 'use') {
+    for (const line of await runUse({ tag, channel })) console.log(line);
+    return;
+  }
+  // --channel is read by `use` alone; anywhere else it is a typo worth naming.
+  if (channel !== null) die('--channel only applies to `termcp use --channel …`');
+  if (verb === 'kill') {
+    for (const line of await killLines(argv.slice(1))) console.log(line);
+    return;
+  }
+  if (verb === 'list') {
+    if (argv.length > 1) die('`list` takes no arguments');
+    for (const line of await listLines()) console.log(line);
+    return;
+  }
   // The binary's own parser would answer a stray `update` with a directive error
   // nobody can act on; the word people mean is `use latest`.
   if (argv[0] === 'update') die('`update` is not a command; use `termcp use latest`');
-  if (channel !== null) die('--channel only applies to `termcp use --channel …`');
 
   // Installing here can take seconds, and a client impatient enough to kill this
   // process mid-download loses nothing: the bytes land in a .part file and
