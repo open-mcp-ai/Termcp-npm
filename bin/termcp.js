@@ -31,6 +31,7 @@
 //                  .version selects, so this is how a switch takes effect.
 //   list           the newest release on each line, with the tag a switch would
 //                  land on. Remembered for a few minutes (TERMCP_CACHE_MINUTES).
+//   rm <tag>       delete one installed release. The selected one is refused.
 // A line is named by its tags (`v0.2.8` stable, `v0.2.8-rc.1` rc, `v0.3.0-beta.2`
 // beta, `nightly-20261002` nightly), so no channel is hard-coded here and a new
 // line needs no change.
@@ -176,7 +177,10 @@ async function apiJSON(pathname) {
     });
     if (!res.ok) return { ok: false, status: res.status };
     return { ok: true, body: await res.json() };
-  } catch {
+  } catch (e) {
+    // The reason belongs in the log: "unreachable" with nothing after it is the
+    // message that takes an hour to chase.
+    log('api', `${pathname}: ${e && e.message ? e.message : e}`);
     return { ok: false, status: 0 };
   }
 }
@@ -662,7 +666,7 @@ function takeWrapperArgs(argv) {
     }
     rest.push(arg);
   }
-  const verb = ['use', 'kill', 'list'].includes(rest[0]) ? rest[0] : null;
+  const verb = ['use', 'kill', 'list', 'rm'].includes(rest[0]) ? rest[0] : null;
   return { argv: rest, verb, tag: verb ? rest[1] : null, channel, mcp };
 }
 
@@ -719,14 +723,15 @@ async function runUse({ tag, channel }) {
 // command comes back as isError instead of ending the process.
 const MCP_TOOL = 'termcp';
 const MCP_PROTOCOL = '2025-06-18'; // echoed back when the client does not name one
-const MCP_USAGE = 'commands: status (no cmd) | list | use <tag>|latest [--channel <name>] | kill [daemon flags]';
+const MCP_USAGE = 'commands: status (no cmd) | list | use <tag>|latest [--channel <name>] | kill [daemon flags] | rm <tag>';
 const MCP_TOOLS = [{
   name: MCP_TOOL,
   description:
     'Manage which termcp release launches run. cmd takes: nothing (what is selected, which line that is, '
     + 'and what is installed), `list` (the newest release on each line, from GitHub), `use <tag>|latest '
     + '[--channel <name>]` (install and select it — a tag may be older, so this downgrades as well as '
-    + 'upgrades), or `kill` (stop the running instance; a client reconnects and starts the selected release).',
+    + 'upgrades), `kill` (stop the running instance; a client reconnects and starts the selected release), '
+    + 'or `rm <tag>` (delete an installed release; the selected one is refused).',
   inputSchema: {
     type: 'object',
     properties: { cmd: { type: 'string', description: `Empty for status. ${MCP_USAGE}` } },
@@ -796,6 +801,31 @@ async function killLines(args) {
   ];
 }
 
+// `rm <tag>`: delete one installed release. Only a tag that is really in
+// versions/ can be named — the list comes from the directory itself, so nothing
+// outside it is reachable by spelling. The selected release is refused: removing
+// it would leave .version naming a binary that is not there, and the next launch
+// would quietly download it again.
+function rmLines(args) {
+  const installed = installedTags();
+  const want = String(args[0] || '').trim();
+  const have = installed.length ? `installed: ${installed.join(', ')}` : 'nothing is installed';
+  if (!want) die(`rm takes a version (${have})`);
+  const tag = installed.find((t) => t === want || t === normalizeTag(want));
+  if (!tag) die(`${normalizeTag(want)} is not installed (${have})`);
+  const current = readVersionFile();
+  if (current && normalizeTag(current) === tag) die(`${tag} is the selected version; switch to another one first`);
+  try {
+    fs.rmSync(path.join(VERSIONS_DIR, tag), { recursive: true, force: true });
+  } catch (e) {
+    // Windows refuses to unlink a running image: an instance started from this
+    // version is still holding it. Nothing is broken, so say what to do.
+    die(`cannot remove ${tag}: ${e.message} (an instance started from it is probably still running; \`kill\` it first)`);
+  }
+  const left = installedTags();
+  return [`removed ${tag}`, left.length ? `installed: ${left.join(', ')}` : 'installed: none'];
+}
+
 // Run one command of the surface above and return its lines. Nothing here prints:
 // the CLI prints the lines, the MCP tool returns them as the tool's text.
 async function runCommand(cmd) {
@@ -805,6 +835,7 @@ async function runCommand(cmd) {
   if (verb === 'status') return statusLines();
   if (verb === 'list') return listLines();
   if (verb === 'kill') return killLines(words.slice(1));
+  if (verb === 'rm') return rmLines(words.slice(1));
   if (verb === 'use') {
     const { verb: used, tag, channel } = takeWrapperArgs(words);
     if (used) return runUse({ tag, channel });
@@ -914,6 +945,10 @@ function serveMcp() {
   if (verb === 'list') {
     if (argv.length > 1) die('`list` takes no arguments');
     for (const line of await listLines()) console.log(line);
+    return;
+  }
+  if (verb === 'rm') {
+    for (const line of rmLines(argv.slice(1))) console.log(line);
     return;
   }
   // The binary's own parser would answer a stray `update` with a directive error

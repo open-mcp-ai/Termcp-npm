@@ -455,6 +455,24 @@ function mcpClient(dir, env = {}) {
     assert.match(strayMcp.stderr, /takes no release/, 'expected the pointer to the tool call: ' + strayMcp.stderr);
     console.log('ok: `list` runs from the command line, and stray flags are refused');
 
+    // `rm` deletes one installed release and refuses the one .version names: that
+    // would leave the record pointing at a binary that is not there.
+    const installedAt2 = (t) => path.join(dir, 'versions', t);
+    assert.equal(version(), 'v9.0.1-rc.9', 'the selected version is the downgrade target');
+    const dropSelected = await run(['rm', version()]);
+    assert.notEqual(dropSelected.status, 0, 'the selected version must not be removable');
+    assert.match(dropSelected.stderr, /is the selected version/, 'expected the refusal: ' + dropSelected.stderr);
+    assert.ok(fs.existsSync(installedAt2('v9.0.1-rc.9')), 'a refused rm must delete nothing');
+    const dropMissing = await run(['rm', 'v9.9.9']);
+    assert.notEqual(dropMissing.status, 0, 'an uninstalled tag must be refused');
+    assert.match(dropMissing.stderr, /is not installed/, 'expected the refusal: ' + dropMissing.stderr);
+    assert.ok(fs.existsSync(installedAt2('v9.0.2')), 'the version about to be dropped must be on disk');
+    const dropped = await run(['rm', 'v9.0.2']);
+    assert.equal(dropped.status, 0, 'rm must work: ' + dropped.stderr);
+    assert.ok(!fs.existsSync(installedAt2('v9.0.2')), 'rm must delete the directory');
+    assert.match(dropped.stdout, /removed v9\.0\.2/, 'rm must say what it removed: ' + dropped.stdout);
+    console.log('ok: `rm` deletes an unselected version and refuses the selected one');
+
     api.srv.close();
   // 12. No digest, no install. A mirror is the party that could hand over
   // something else, so bytes that cannot be checked against the official digest
@@ -562,6 +580,15 @@ function mcpClient(dir, env = {}) {
     const bogus = await call('nonsense');
     assert.equal(bogus.result.isError, true, 'an unknown command must be a tool error');
     assert.match(text(bogus), /unknown command/, 'expected the command list back: ' + text(bogus));
+    // rm is the same function on both doors: one release goes, the selected one
+    // is refused.
+    const dropSelected = await call(`rm ${fs.readFileSync(path.join(dir, '.version'), 'utf8').trim()}`);
+    assert.equal(dropSelected.result.isError, true, 'the selected version must not be removable');
+    assert.match(text(dropSelected), /is the selected version/, 'expected the refusal: ' + text(dropSelected));
+    const dropped = await call('rm v9.0.2');
+    assert.ok(!dropped.result.isError, 'rm must work over MCP: ' + text(dropped));
+    assert.match(text(dropped), /removed v9\.0\.2/, 'expected the report: ' + text(dropped));
+    assert.ok(!fs.existsSync(path.join(dir, 'versions', 'v9.0.2')), 'the directory must be gone');
     const alive = await mcp.request('ping');
     assert.ok(alive.result, 'the server must still answer after two refusals');
     assert.deepEqual(mcp.stray, [], 'stdout must carry frames and nothing else');

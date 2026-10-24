@@ -57,6 +57,9 @@ termcp use --channel rc       # 换到 rc 线，并切到它最新的
 
 # 更新并结束运行中的实例
 termcp use latest && termcp kill
+
+# 删掉不再需要的版本（每个约 13 MB）
+termcp rm <版本>
 ```
 
 `use` 只写 `.version`，已经在跑的实例仍然用旧二进制。`kill` 结束后台 daemon
@@ -79,7 +82,7 @@ termcp use latest && termcp kill
 ```
 
 这个 tool 只有一个参数 `cmd`：留空看状态，或者填上面命令表里的一个
-（`list`、`use <版本>|latest [--channel <名字>]`、`kill`）。
+（`list`、`use <版本>|latest [--channel <名字>]`、`kill`、`rm <版本>`）。
 
 
 ## 卸载

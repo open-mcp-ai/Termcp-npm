@@ -57,6 +57,9 @@ termcp use --channel rc       # move onto the rc line and switch to its newest
 
 # Update and stop the running instance in one go
 termcp use latest && termcp kill
+
+# Drop a version you no longer need (each is ~13 MB)
+termcp rm <tag>
 ```
 
 `use` only writes `.version`, so an instance already serving keeps the old binary.
@@ -81,7 +84,7 @@ for status:
 ```
 
 The tool takes one argument, `cmd`: empty for status, or a command from the list
-above (`list`, `use <tag>|latest [--channel <name>]`, `kill`).
+above (`list`, `use <tag>|latest [--channel <name>]`, `kill`, `rm <tag>`).
 
 
 ## Uninstall
