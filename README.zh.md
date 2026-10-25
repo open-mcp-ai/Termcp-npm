@@ -2,95 +2,79 @@
 
 [English](./README.md) | **中文**
 
-**termcp 自身的用法（flag、安装、MCP 客户端、Web UI）以上游 README 为准：
+**termcp 自身的用法（flag、安装、Web UI）以上游 README 为准：
 <https://github.com/open-mcp-ai/termcp>**
 
-## 用法
-
 ```bash
-npx -y @open-mcp-ai/termcp           # 用一次（不弹安装提示）
+npx -y @open-mcp-ai/termcp           # 用一次
 npm i -g @open-mcp-ai/termcp         # 或装出 termcp 命令
 ```
 
-需要 Node 18+；不需要 Go 工具链（二进制是预编译下载的）。
+需要 Node 18+；不需要 Go 工具链（二进制是预编译下载的，约 13 MB）。
 
-## stdio 方式的 MCP（termcp v0.2.5+）
+## MCP
 
 ```json
 {
   "mcpServers": {
-    "termcp": {
-      "command": "npx",
-      "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"]
-    }
+    "termcp":     { "command": "npx", "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"] },
+    "termcp-use": { "command": "npx", "args": ["-y", "@open-mcp-ai/termcp", "use", "--mcp", "--checkupdate"] }
   }
 }
 ```
 
 ```bash
-claude mcp add termcp -- npx -y @open-mcp-ai/termcp daemon stdio
+claude mcp add termcp     -- npx -y @open-mcp-ai/termcp daemon stdio
+claude mcp add termcp-use -- npx -y @open-mcp-ai/termcp use --mcp --checkupdate
 ```
+
+`termcp` 提供 `term`（v0.2.5+）；`termcp-use` 只提供一个 tool `use`，唯一参数就是下一节那些行。
+`--checkupdate` 不给 tool 加东西 —— 它往提示词里加一条：会话开始查一次，有更新就说出来。
+
+## `use`
+
+```
+use [<版本>|latest] [--channel <名字>[,<名字>]]     选择（不带参数 = 看状态）
+use --list  [--channel <名字>[,<名字>]]             每条线最新的，或某条线的全部 tag
+use --check [--force] [--channel <名字>[,<名字>]]   有没有更新的？
+use --delay <30m|6h|2d|default>                     一次检查的结果能复用多久
+use --bin <命令...>|off                             启动改成跑别的东西
+use --kill [daemon flags]                           停掉运行中的实例
+use --rm <版本>                                     删掉一个已装的发行版
+use --mcp [--checkupdate]                           以 MCP 提供上面这些
+```
+
+- **是选择，不是安装。** 启动跑 `~/.termcp/.version` 里的一行；字节下次启动才到，
+  运行中的实例在那之前仍用旧二进制。
+- **`--kill` 是唯一执行命令的动作**：跑盘上二进制的 `daemon stop`。为了停东西不下载、
+  不安装，没装过的版本直接拒绝，不会被执行。
+- **其余的词原样交给二进制。**
+- **渠道**就是一条线（`v0.2.8` stable、`v0.2.8-rc.2` rc、`nightly-20261002` nightly）。
+  `--channel` 收逗号列表，只对 `latest`、`--list`、`--check` 有效。`--check` 只判决当前
+  那条线，答案复用一天（`--delay`；`--force` 当场问）。三个事实放在
+  `~/.termcp/.check/{channel,delay,lastcheck}`；`channel` 是范围，不是许可。
+- **`--bin`** 让每次启动跑自己的构建（参数保留）：`~/.termcp/.bin` 里的一行
+  （`use --bin off` 清掉）。`TERMCP_BIN` 同样只影响一次。
 
 ## 环境变量
 
-| 变量                   | 作用                                                                |
-| :--------------------- | :-------------------------------------------------------------------- |
-| `TERMCP_VERSION`       | 固定一个发行版，或用 `latest` 重新解析。         |
-| `TERMCP_DATA_DIR`      | 缓存位置（默认 `~/.termcp`）——与 termcp 用的是同一个根目录。|
-| `TERMCP_BIN`           | 用这个二进制而不是下载（例如本地构建）。       |
-| `TERMCP_MIRROR`        | 逗号分隔的镜像前缀，替代内置列表来探测。 |
-| `TERMCP_SKIP_DOWNLOAD` | 从不下载；用 `TERMCP_BIN` 或 `PATH` 上的 `termcp`。    |
-| `TERMCP_API`           | GitHub API 基址（默认 `https://api.github.com`），用于镜像或测试服务。 |
-| `TERMCP_SKIP_VERIFY`   | 允许安装没有公布 SHA-256 的发行版。已公布但与字节不符的仍然失败。 |
-| `TERMCP_CACHE_MINUTES` | `termcp list` 复用已拉取列表的分钟数（默认 10；`0` 表示每次都问 GitHub）。 |
-
-## 渠道与切换版本
-
-termcp 启动时**绝不自动检查更新**：常规启动只读 `~/.termcp/.version`，不发任何网络请求。
-需要变动版本时：
-
-```bash
-termcp list                   # 每条线最新的发行版
-termcp use latest             # 沿 .version 当前所在的那条线走到最新
-termcp use <版本>             # 任意指定版本——降级、升级或临时固定
-termcp use --channel rc       # 换到 rc 线，并切到它最新的
-
-# 更新并结束运行中的实例
-termcp use latest && termcp kill
-
-# 删掉不再需要的版本（每个约 13 MB）
-termcp rm <版本>
-```
-
-`use` 只写 `.version`，已经在跑的实例仍然用旧二进制。`kill` 结束后台 daemon
-（手动起的实例不动），下一次连上来的就用选中的那个版本。
-
-## 给 agent 用的 MCP 工具
-
-`--mcp` 把同一套命令以**一个** tool（名为 `termcp`）暴露在 stdio 上，agent 因此可以
-自己升降 termcp 的版本。它不启动任何东西，只看状态时也不需要二进制：
-
-```json
-{
-  "mcpServers": {
-    "termcp-versions": {
-      "command": "npx",
-      "args": ["-y", "@open-mcp-ai/termcp", "--mcp"]
-    }
-  }
-}
-```
-
-这个 tool 只有一个参数 `cmd`：留空看状态，或者填上面命令表里的一个
-（`list`、`use <版本>|latest [--channel <名字>]`、`kill`、`rm <版本>`）。
-
+| 变量 | 作用 |
+| :--- | :--- |
+| `TERMCP_VERSION` | 固定一个发行版，或用 `latest` 重新解析。 |
+| `TERMCP_DATA_DIR` | 缓存根目录（默认 `~/.termcp`）。 |
+| `TERMCP_BIN` | 用这个二进制而不是下载，只对这一次运行有效。 |
+| `TERMCP_MIRROR` | 逗号分隔的镜像前缀，替代内置列表来探测。 |
+| `TERMCP_SKIP_DOWNLOAD` | 从不下载；用 `TERMCP_BIN` 或 `PATH` 上的 `termcp`。 |
+| `TERMCP_API` | GitHub API 基址（默认 `https://api.github.com`）。 |
+| `TERMCP_SKIP_VERIFY` | 允许安装没有公布 SHA-256 的发行版。 |
+| `TERMCP_CACHE_MINUTES` | `use --list` 的缓存分钟数（默认 10；`0` 每次都问）。 |
+| `TERMCP_CHECK_HOURS` | `use --check` 信任那份列表的小时数（默认 24；`0` 每次都查）。 |
 
 ## 卸载
 
-删掉数据目录（默认 `~/.termcp`，或 `$TERMCP_DATA_DIR`）：`versions/` 下的二进制、
-会话、配置。只删 `.version` 会让下次运行解析最新发行版，已装的二进制保留。
+删掉 `~/.termcp`（或 `$TERMCP_DATA_DIR`）。
 
 ## 许可证
 
-MIT，与 termcp 相同。本包运行的二进制遵循
+MIT，与 termcp 相同；本包运行的二进制遵循
 [上游许可证](https://github.com/open-mcp-ai/termcp/blob/main/LICENSE)。
