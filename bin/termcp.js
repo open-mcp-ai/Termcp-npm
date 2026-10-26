@@ -112,6 +112,7 @@
 // `TERMCP_DATA_DIR=/opt/termcp termcp ...` moves both.
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -276,11 +277,18 @@ function assetDigest(release, asset) {
   };
 }
 
+// The digest for an asset plus the one for its `.gz` twin, from the same release
+// object: one API response answers both forms. A release that publishes no twin
+// yields `{ sha256: null }`, and the caller downloads the raw asset.
+function withGz(meta, release, asset) {
+  return Object.assign(meta, { gz: assetDigest(release, `${asset}.gz`) });
+}
+
 // Official metadata for one release.
 async function releaseMeta(asset, tag) {
   const r = await apiJSON(`releases/tags/${normalizeTag(tag)}`);
   if (!r.ok) return { offline: true, status: r.status };
-  return assetDigest(r.body, asset);
+  return withGz(assetDigest(r.body, asset), r.body, asset);
 }
 
 // vX.Y.Z with the pre-release identifiers split out, or null for a tag that is
@@ -375,7 +383,8 @@ function pickOnLines(list, asset, channels) {
     return { empty: true, lines: [...new Set(list.map((rel) => channelOf(rel.tag_name)))].sort() };
   }
   const wanted = new Set(picks);
-  return assetDigest(list.find((rel) => wanted.has(rel.tag_name)), asset);
+  const rel = list.find((r) => wanted.has(r.tag_name));
+  return withGz(assetDigest(rel, asset), rel, asset);
 }
 
 // The newest release on a line, out of a list already in hand.
@@ -385,7 +394,8 @@ function pickOnLine(list, asset, channel) {
     // Nothing on that line: the lines that do exist are what the answer can be.
     return { empty: true, lines: [...new Set(list.map((rel) => channelOf(rel.tag_name)))].sort() };
   }
-  return assetDigest(list.find((rel) => rel.tag_name === tags[0]), asset);
+  const rel = list.find((r) => r.tag_name === tags[0]);
+  return withGz(assetDigest(rel, asset), rel, asset);
 }
 
 // The newest release on a channel, with its digest. A switch resolves against a
@@ -691,6 +701,100 @@ async function verify(part, dest, sha256, total) {
   fs.renameSync(part, dest);
 }
 
+// A gzip magic number at the front of the file where the binary belongs means a
+// run died between moving the verified .gz into place and unpacking it (see
+// unpackGz). Finishing that unpack is cheaper, and kinder, than answering every
+// later launch with ENOEXEC until someone deletes the file by hand.
+function isGzipped(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const head = Buffer.alloc(2);
+      fs.readSync(fd, head, 0, 2, 0);
+      return head[0] === 0x1f && head[1] === 0x8b;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+// The .gz holds the binary: unpack it into `stage` and move it over `dest` in one
+// rename, so the path a launch execs either holds the binary or does not exist.
+// gunzipSync refuses a stream whose CRC32 or length does not add up, which is the
+// check between the bytes that were verified and the file that runs.
+function unpackGz(dest, stage, tag) {
+  let raw;
+  try {
+    raw = zlib.gunzipSync(fs.readFileSync(dest));
+  } catch (e) {
+    throw new Error(`the .gz for ${tag} does not decompress (its checksum was fine; TERMCP_NO_GZIP=1 fetches the raw asset): ${e.message}`);
+  }
+  fs.writeFileSync(stage, raw);
+  fs.chmodSync(stage, 0o755);
+  fs.renameSync(stage, dest);
+  log('install', `unpacked ${(raw.length / 1048576).toFixed(1)} MB`);
+}
+
+// Download one asset and install it at `dest`. Every source is measured for the
+// file that is actually fetched: the .gz and the raw binary are different files,
+// so a winner for one says nothing about the other.
+async function installAsset({ asset, sha256, size, unpack }, tag, dest) {
+  const canonical = `https://github.com/${REPO}/releases/download/${tag}/${asset}`;
+  const configured = (process.env.TERMCP_MIRROR || '').split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean);
+  const sources = [...(configured.length ? configured : MIRRORS).map((m) => `${m}/${canonical}`), canonical];
+
+  const part = `${dest}.${process.pid}.part`;
+  log('probe', `measuring ${sources.length} sources for ${tag} (${process.platform}/${process.arch})`);
+  const ranked = await measureAll(sources, part);
+
+  // Keep the winner's probed bytes; the rest is fetched from where it stopped.
+  // Every probe file goes, including the winner's when it brought nothing: the
+  // comparison is against the file that was KEPT, not against the winner's URL, so
+  // a probe that produced no bytes cannot leave an empty `.probeN` behind.
+  const winner = ranked[0];
+  const keep = winner.got > 0 ? winner.part : null;
+  if (keep) fs.renameSync(keep, part);
+  for (const r of ranked) if (r.part !== keep) { try { fs.unlinkSync(r.part); } catch {} }
+
+  try {
+    let lastError;
+    for (const [index, r] of ranked.entries()) {
+      try {
+        const offset = fs.existsSync(part) ? fs.statSync(part).size : 0;
+        log('download', `${offset ? 'resuming' : 'starting'} from ${sourceName(r.url)} (${index + 1}/${ranked.length})${offset ? ` at ${(offset / 1048576).toFixed(1)} MB` : ''}`);
+        const have = await resume(r.url, part, size);
+        if (size && have < size) throw new Error(`source stopped early: ${have}/${size} bytes`);
+        log('download', `received ${(have / 1048576).toFixed(1)} MB`);
+        log('verify', sha256 ? 'checking file size and SHA-256' : 'checking file size only (TERMCP_SKIP_VERIFY)');
+        await verify(part, dest, sha256, size);
+        if (unpack) {
+          try {
+            unpackGz(dest, `${part}.raw`, tag);
+          } catch (e) {
+            // The verified .gz is unusable: leave nothing a later run could
+            // mistake for the binary, and let the caller try the raw asset.
+            try { fs.rmSync(dest, { force: true }); } catch {}
+            // Every source serves the same bytes, which the digest just matched:
+            // another one cannot decompress better.
+            e.noRetry = true;
+            throw e;
+          }
+        }
+        return dest;
+      } catch (e) {
+        lastError = e;
+        if (e.noRetry) throw e;
+        log('download', `${sourceName(r.url)} failed: ${e.message} (${fs.existsSync(part) ? fs.statSync(part).size : 0} bytes saved)${index + 1 < ranked.length ? '; trying next source' : ''}`);
+      }
+    }
+    throw new Error(`all ${ranked.length} sources failed (last: ${lastError && lastError.message})`);
+  } finally {
+    try { fs.unlinkSync(part); } catch {}
+  }
+}
+
 // Installed versions, newest first — used to stay runnable when GitHub is
 // unreachable. mtime is enough: it is whatever was downloaded last.
 function installedTags() {
@@ -828,24 +932,37 @@ async function binary(forceTag, channel) {
     return found;
   }
 
-  const asset = assetName();
-  const { tag, remember, meta: initial } = await resolveVersion(asset, forceTag, channel);
+  const raw = assetName();
+  const { tag, remember, meta: initial } = await resolveVersion(raw, forceTag, channel);
   const dest = binaryPath(tag);
   if (fs.existsSync(dest)) {
+    // A run that died between the download and the unpack leaves the verified .gz
+    // where the binary belongs; finish that instead of exec'ing gzip bytes.
+    if (isGzipped(dest)) {
+      try {
+        unpackGz(dest, `${dest}.${process.pid}.part`, tag);
+        log('cache', `finished unpacking ${tag} left by an earlier run`);
+      } catch (e) {
+        log('install', `${e.message}; downloading again`);
+        try { fs.rmSync(dest, { force: true }); } catch {}
+      }
+    }
     // Already installed: no version check, no network. Still record the tag when
     // this run resolved it (first run, or an explicit `latest`), otherwise a
     // later run would fall back to the stale .version.
-    if (remember) rememberVersion(tag);
-    log('cache', `using installed ${tag} for ${process.platform}/${process.arch}`);
-    return dest;
+    if (fs.existsSync(dest)) {
+      if (remember) rememberVersion(tag);
+      log('cache', `using installed ${tag} for ${process.platform}/${process.arch}`);
+      return dest;
+    }
   }
 
   // Need the release's digest (and size) before fetching bytes. Without the
   // digest there is nothing to check the bytes against, and a mirror is exactly
   // the party that could hand over something else — so the download is refused
   // rather than installed on trust, unless TERMCP_SKIP_VERIFY asks for it.
-  if (!(initial && initial.tag)) log('metadata', `checking release ${tag} for ${asset}`);
-  const meta = initial && initial.tag ? initial : await releaseMeta(asset, tag);
+  if (!(initial && initial.tag)) log('metadata', `checking release ${tag} for ${raw}`);
+  const meta = initial && initial.tag ? initial : await releaseMeta(raw, tag);
   if (meta.offline && meta.status === 404) {
     die(`no such release: ${tag} (run \`termcp use latest\` to move to the newest on this line)`);
   }
@@ -854,55 +971,43 @@ async function binary(forceTag, channel) {
       die(`cannot verify ${tag}: the GitHub API is unreachable, so there is no SHA-256 to check against (TERMCP_SKIP_VERIFY=1 installs unchecked)`);
     }
     log('metadata', `GitHub API unreachable and TERMCP_SKIP_VERIFY is set; installing ${tag} unchecked`);
-  } else if (!meta.sha256) {
-    if (!SKIP_VERIFY) {
-      die(`cannot verify ${tag}: no SHA-256 digest is published for ${asset} (TERMCP_SKIP_VERIFY=1 installs unchecked)`);
-    }
-    log('metadata', `no SHA-256 digest for ${asset} and TERMCP_SKIP_VERIFY is set; installing ${tag} unchecked`);
-  } else {
-    log('metadata', `SHA-256 available for ${asset}${meta.size ? ` (${(meta.size / 1048576).toFixed(1)} MB)` : ''}`);
+  } else if (!meta.sha256 && SKIP_VERIFY) {
+    log('metadata', `no SHA-256 digest for ${raw} and TERMCP_SKIP_VERIFY is set; installing ${tag} unchecked`);
   }
 
-  const canonical = `https://github.com/${REPO}/releases/download/${tag}/${asset}`;
-  const configured = (process.env.TERMCP_MIRROR || '').split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean);
-  const sources = [...(configured.length ? configured : MIRRORS).map((m) => `${m}/${canonical}`), canonical];
+  // The release may ship a gzip of the binary next to it: thirteen megabytes on
+  // the wire become five. Its own digest decides whether it is usable — with one,
+  // the .gz is tried first and the raw asset is the fallback, so a .gz that cannot
+  // be fetched, verified or unpacked costs a retry rather than an install. What is
+  // verified is the .gz against that digest; what runs is what gunzip makes of it,
+  // whose CRC32 is the check between the two.
+  const attempts = [];
+  if (!process.env.TERMCP_NO_GZIP && !meta.offline && meta.gz && meta.gz.sha256) {
+    attempts.push({ asset: `${raw}.gz`, sha256: meta.gz.sha256, size: meta.gz.size, unpack: true });
+  }
+  if (meta.sha256 || SKIP_VERIFY) {
+    attempts.push({ asset: raw, sha256: meta.sha256, size: meta.size || 0, unpack: false });
+  }
+  if (!attempts.length) {
+    die(`cannot verify ${tag}: no SHA-256 digest is published for ${raw} (TERMCP_SKIP_VERIFY=1 installs unchecked)`);
+  }
 
-  const { sha256, size } = meta;
-  const part = `${dest}.${process.pid}.part`;
-  log('probe', `measuring ${sources.length} sources for ${tag} (${process.platform}/${process.arch})`);
-  const ranked = await measureAll(sources, part);
-
-  // Keep the winner's probed bytes; the rest is fetched from where it stopped.
-  // Every probe file goes, including the winner's when it brought nothing: the
-  // comparison is against the file that was KEPT, not against the winner's URL, so
-  // a probe that produced no bytes cannot leave an empty `.probeN` behind.
-  const winner = ranked[0];
-  const keep = winner.got > 0 ? winner.part : null;
-  if (keep) fs.renameSync(keep, part);
-  for (const r of ranked) if (r.part !== keep) { try { fs.unlinkSync(r.part); } catch {} }
-
-  try {
-    let lastError;
-    for (const [index, r] of ranked.entries()) {
-      try {
-        const offset = fs.existsSync(part) ? fs.statSync(part).size : 0;
-        log('download', `${offset ? 'resuming' : 'starting'} from ${sourceName(r.url)} (${index + 1}/${ranked.length})${offset ? ` at ${(offset / 1048576).toFixed(1)} MB` : ''}`);
-        const have = await resume(r.url, part, size);
-        if (size && have < size) throw new Error(`source stopped early: ${have}/${size} bytes`);
-        log('download', `received ${(have / 1048576).toFixed(1)} MB`);
-        log('verify', sha256 ? 'checking file size and SHA-256' : 'checking file size only (TERMCP_SKIP_VERIFY)');
-        await verify(part, dest, sha256, size);
-        log('install', `installed ${tag} for ${process.platform}/${process.arch}`);
-        if (remember) rememberVersion(tag);
-        return dest;
-      } catch (e) {
-        lastError = e;
-        log('download', `${sourceName(r.url)} failed: ${e.message} (${fs.existsSync(part) ? fs.statSync(part).size : 0} bytes saved)${index + 1 < ranked.length ? '; trying next source' : ''}`);
-      }
+  for (const [i, a] of attempts.entries()) {
+    const next = attempts[i + 1];
+    if (a.sha256) {
+      log('metadata', `SHA-256 available for ${a.asset}${a.size ? ` (${(a.size / 1048576).toFixed(1)} MB${a.unpack ? ', unpacks on arrival' : ''})` : ''}`);
     }
-    throw new Error(`all ${ranked.length} sources failed (last: ${lastError && lastError.message})`);
-  } finally {
-    try { fs.unlinkSync(part); } catch {}
+    try {
+      await installAsset(a, tag, dest);
+      log('install', `installed ${tag} for ${process.platform}/${process.arch}`);
+      if (remember) rememberVersion(tag);
+      return dest;
+    } catch (e) {
+      // A .gz that fails is a reason to try the raw asset, not a reason to fail:
+      // the release published both, and the second one needs no decompressing.
+      if (!next) die(e.message);
+      log('install', `${a.asset} failed: ${e.message}; falling back to ${next.asset}`);
+    }
   }
 }
 

@@ -98,16 +98,19 @@ function runWrapper(mirrors, version, timeout = 180000, extraEnv = null, args = 
 }
 
 // A fake mirror: serves `body` with Range support, at a chosen chunk delay.
-// `dieAfter` drops the connection after N bytes, to exercise failover.
+// `dieAfter` drops the connection after N bytes, to exercise failover. `body` may
+// be a function of the request, so one server can serve the raw asset and its .gz
+// twin as different files.
 function mirror(body, { delayMs = 0, dieAfter = 0, tag = '' } = {}) {
   const srv = http.createServer((req, res) => {
+    const file = typeof body === 'function' ? body(req) : body;
     const m = /bytes=(\d+)-/.exec(req.headers.range || '');
     const start = m ? Number(m[1]) : 0;
-    const slice = body.subarray(start);
+    const slice = file.subarray(start);
     res.writeHead(start ? 206 : 200, {
       'content-type': 'application/octet-stream',
       'content-length': String(slice.length),
-      ...(start ? { 'content-range': `bytes ${start}-${body.length - 1}/${body.length}` } : {}),
+      ...(start ? { 'content-range': `bytes ${start}-${file.length - 1}/${file.length}` } : {}),
     });
     let sent = 0;
     const step = Math.max(1, Math.floor(slice.length / 8));
@@ -273,6 +276,67 @@ function mcpClient(dir, env = {}, args = ['use', '--mcp']) {
   assert.match(badRun.stderr, /checksum mismatch/, 'expected a checksum mismatch: ' + badRun.stderr);
   assert.ok(!fs.existsSync(BIN(remembered)), 'rejected download must not be installed');
   console.log('ok: checksum mismatch rejected, nothing installed');
+
+  // 6b. The .gz middle step: a release may publish the binary gzipped, and that is
+  // then what is downloaded — verified against ITS digest — while what lands is the
+  // decompressed bytes. A .gz that verifies but does not unpack falls back to the
+  // raw asset rather than failing the install, and a run that died between the two
+  // renames is finished by the next one.
+  {
+    const zlib = require('node:zlib');
+    const dir = path.join(os.tmpdir(), `termcp-gz-${process.pid}`);
+    const TAG = 'v9.9.9';
+    const where = path.join(dir, 'versions', TAG, process.platform === 'win32' ? 'termcp.exe' : 'termcp');
+    const gz = zlib.gzipSync(real, { level: 9 });
+    const release = (gzBytes) => ({
+      tag_name: TAG,
+      draft: false,
+      prerelease: false,
+      assets: [
+        { name: ASSET, size: real.length, digest: `sha256:${sha(real)}` },
+        ...(gzBytes ? [{ name: `${ASSET}.gz`, size: gzBytes.length, digest: `sha256:${sha(gzBytes)}` }] : []),
+      ],
+    });
+    const fresh = () => fs.rmSync(dir, { recursive: true, force: true });
+    const runGz = (api, host) => runWrapper([host.url], TAG, 180000, { TERMCP_API: api.url, TERMCP_DATA_DIR: dir });
+
+    fresh();
+    const api = await releasesAPI(() => [release(gz)]);
+    const host = await mirror((req) => (req.url.endsWith('.gz') ? gz : real), { tag: 'gz' });
+    const ok = await runGz(api, host);
+    assert.equal(ok.status, 0, 'a gz release must install: ' + ok.stderr);
+    assert.match(ok.stderr, /unpacks on arrival/, 'the .gz must be the one chosen: ' + ok.stderr);
+    assert.match(ok.stderr, /unpacked [\d.]+ MB/, 'the unpack must be logged: ' + ok.stderr);
+    assert.equal(sha(fs.readFileSync(where)), sha(real), 'the installed binary must be the decompressed bytes');
+    console.log('ok: a .gz release is fetched compressed and unpacked into place');
+
+    // Verified (its digest matches the bytes served) but not a valid gzip: the
+    // checksum cannot catch that, so the raw asset is the answer.
+    fresh();
+    const corrupt = Buffer.from(gz);
+    corrupt[corrupt.length - 1] ^= 0xff;
+    const apiBad = await releasesAPI(() => [release(corrupt)]);
+    const hostBad = await mirror((req) => (req.url.endsWith('.gz') ? corrupt : real), { tag: 'gz-bad' });
+    const bad = await runGz(apiBad, hostBad);
+    assert.equal(bad.status, 0, 'a broken .gz must fall back to the raw asset: ' + bad.stderr);
+    assert.match(bad.stderr, /does not decompress/, 'the unpack must be the failure: ' + bad.stderr);
+    assert.match(bad.stderr, /falling back to termcp-/, 'the raw asset must be the fallback: ' + bad.stderr);
+    assert.equal(sha(fs.readFileSync(where)), sha(real), 'the fallback must install the raw binary');
+    console.log('ok: a .gz that does not decompress falls back to the raw asset');
+
+    // Killed between `verify` and `unpack`: the .gz sits where the binary belongs,
+    // and the next run finishes it instead of exec'ing gzip bytes.
+    fresh();
+    fs.mkdirSync(path.dirname(where), { recursive: true });
+    fs.writeFileSync(where, gz);
+    const fix = await runGz(api, host);
+    assert.equal(fix.status, 0, 'an interrupted unpack must be finished: ' + fix.stderr);
+    assert.ok(!/\[(?:probe|download)\]/.test(fix.stderr), 'recovery must not download: ' + fix.stderr);
+    assert.equal(sha(fs.readFileSync(where)), sha(real), 'recovery must leave the decompressed bytes');
+    api.srv.close(); host.srv.close(); apiBad.srv.close(); hostBad.srv.close();
+    fresh();
+    console.log('ok: an interrupted unpack is finished by the next run, without a download');
+  }
 
   // 7. TERMCP_DATA_DIR relocates the cache — the same variable termcp itself
   // honours — and is created on demand.
