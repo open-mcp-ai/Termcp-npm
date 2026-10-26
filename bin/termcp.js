@@ -508,6 +508,62 @@ async function cachedReleases() {
   return { ok: true, list: r.list, at: Date.now() };
 }
 
+// --- the standing check --------------------------------------------------------
+// With `--checkupdate` the server keeps the shared cache warm while it runs, so
+// the handshake can answer "is anything newer" by reading a file. It is the same
+// cache `use --check` reads and writes, behind the same window, so the two cannot
+// disagree and GitHub is asked at most once per window.
+//
+// NEVER ON THE HANDSHAKE'S PATH. A client waits for that reply, and a check that
+// takes twenty seconds is a client that times out; the verdict is read from disk,
+// and this loop is what puts it there.
+async function refreshUpdateCache() {
+  try {
+    const { ms } = checkWindow();
+    const hit = readCache();
+    if (hit && hit.at && Date.now() - hit.at < ms) return; // still inside the window
+    const r = await fetchReleases();
+    if (r.ok) writeCache(r.list);
+  } catch {
+    // A server that cannot reach GitHub still serves; the next tick tries again.
+  }
+}
+
+// One tick per window: the first at startup (from the cache when it is fresh), the
+// next when that answer goes stale. A window of 0 means "ask every time", which
+// for a background loop becomes a one-minute floor rather than a spin.
+function scheduleChecks() {
+  const { ms } = checkWindow();
+  const timer = setTimeout(async () => {
+    await refreshUpdateCache();
+    scheduleChecks();
+  }, Math.max(ms, 60000));
+  // A client that closes stdin must still end this process: a pending timer is not
+  // a reason to stay alive.
+  if (timer.unref) timer.unref();
+}
+
+// What the handshake says about updates, from files only — never a request. Null
+// when there is nothing to say (no `--checkupdate`, or a cache that cannot be read).
+function updateNote() {
+  try {
+    const hit = readCache();
+    if (!hit) return 'update: no check has run yet.';
+    const when = `checked ${ageOf(hit.at)}`;
+    const current = readVersionFile();
+    if (!current) return `update: nothing is selected yet (${when}).`;
+    const tag = normalizeTag(current);
+    const line = channelOf(tag);
+    const pick = pickOnLine(hit.list, assetName(), line);
+    if (!pick.tag) return `update: nothing is published on ${line} (${when}).`;
+    return compareTagNames(pick.tag, tag) > 0
+      ? `update: ${pick.tag} is newer on ${line} than the current ${tag} (${when}).`
+      : `update: ${tag} is the newest on ${line} (${when}).`;
+  } catch {
+    return null;
+  }
+}
+
 // Measure one source: ranged GET, bytes streamed into its own temp file so the
 // winner's head can be kept instead of re-downloaded. Resolves early the moment
 // it has FAST_BYTES, otherwise on the deadline with whatever arrived.
@@ -1013,14 +1069,16 @@ const MCP_USAGE = 'empty for what launches and what is on disk | <tag>|latest [-
 const MCP_INSTRUCTIONS = 'Manages which termcp release launches run: what is selected, which line that is, '
   + 'and moving between releases. It never starts termcp. Every action is an option of `use`, the one '
   + 'word this tool and the command line share.';
-const MCP_CHECKUPDATE = ' At the start of a session, run `use --check` once: if a newer release exists on '
-  + 'the line in use, tell the user about it and let them decide — do not upgrade unless they ask. '
-  + 'Several lines can be watched at once (`use --check --channel rc,nightly`), and `.check/channel` '
-  + 'under the data directory is where the user writes the ones to watch by default — read it, do not '
-  + 'write it. How long a check may reuse its answer is `use --delay <30m|6h|2d>`, which is yours to '
-  + 'set when asked.';
+// `--checkupdate` is the standing check, and it costs the agent nothing: the
+// server keeps the shared cache warm while it runs, and the handshake states what
+// the file says. It does not add a tool, and it does not ask anyone to make a call.
+const MCP_CHECKUPDATE = ' This server also checks for newer releases in the background while it runs, and '
+  + 'states what it found — in the handshake, in this description, and on the end of a tool result when the '
+  + 'command did not already answer it. So nothing here asks you to spend a call asking. If it names a newer '
+  + 'release, tell the user and let them decide; do not switch unless they ask. `use --check --force` '
+  + 'asks GitHub now, and `use --delay <30m|6h|2d>` sets how long an answer may be reused.';
 
-const mcpTools = (checkUpdate) => [{
+const mcpTools = (checkUpdate, note) => [{
   name: MCP_TOOL,
   description:
     'Manage which termcp release launches run. `cmd` is the same line the CLI takes, minus the leading '
@@ -1036,7 +1094,10 @@ const mcpTools = (checkUpdate) => [{
     + 'command instead of any release — a developer\'s own build, arguments included — and `off` restores '
     + 'the default flow; `--kill [daemon flags]` stops the running instance, so a client that reconnects '
     + 'starts the selected release; `--rm <tag>` deletes an installed release, refusing the selected one.'
-    + (checkUpdate ? MCP_CHECKUPDATE : ''),
+    // The tool list is the other half of what the agent sees at connect time, so the
+    // standing verdict belongs here too: an agent that reads the tool and never
+    // re-reads the handshake still learns there is a newer release.
+    + (checkUpdate ? MCP_CHECKUPDATE + (note ? ' ' + note : '') : ''),
   inputSchema: {
     type: 'object',
     properties: { cmd: { type: 'string', description: `The same line the command line takes: ${MCP_USAGE}` } },
@@ -1415,6 +1476,20 @@ function run(bin, args) {
   });
 }
 
+// A tool result, plus the standing verdict when the command did not already give
+// it. `--check` and `--list` answer the update question themselves, so the tag they
+// already printed is the marker: the note is for every other call, where the answer
+// would otherwise wait for the next handshake. The words match the handshake's — a
+// second prefix would read as a second kind of statement.
+function withUpdateNote(lines, checkUpdate) {
+  if (!checkUpdate) return lines; // a plain server says nothing about releases
+  const note = updateNote();
+  const newer = /^update: (\S+) is newer /.exec(note);
+  if (!newer) return lines; // nothing newer, or nothing known yet: stay quiet
+  if (lines.join('\n').includes(newer[1])) return lines;
+  return lines.concat(note);
+}
+
 // The stdio loop: newline-delimited JSON-RPC 2.0, no SDK — the handshake, one
 // tool, and nothing else is a dependency this package would pay for on every
 // `npx`. Frames are handled in order (a switch and a kill must not interleave),
@@ -1423,7 +1498,17 @@ function serveMcp({ checkUpdate }) {
   let pkg = { version: '0.0.0' };
   try { pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')); } catch {}
   let queue = Promise.resolve(); // one call at a time: a switch and a kill must not interleave
-  const tools = mcpTools(checkUpdate);
+  // Built per request, not once at startup: the update sentence is what the files
+  // say NOW, and a frozen copy would answer with yesterday's verdict for a server
+  // that runs all day.
+  const toolsNow = () => mcpTools(checkUpdate, checkUpdate ? updateNote() : null);
+  if (checkUpdate) {
+    // The standing check: ask once now (from the cache when it is fresh), then
+    // once per window, so a long session notices a release published mid-session
+    // without any agent spending a call on it.
+    refreshUpdateCache();
+    scheduleChecks();
+  }
   const write = (msg) => { try { process.stdout.write(JSON.stringify(msg) + '\n'); } catch {} };
   const reply = (id, result) => write({ jsonrpc: '2.0', id, result });
   const fail = (id, code, message) => write({ jsonrpc: '2.0', id, error: { code, message } });
@@ -1438,7 +1523,12 @@ function serveMcp({ checkUpdate }) {
       // way. A leading `use` is what a caller will type; without it the rest reads
       // as its arguments, so both forms reach the same parser rather than this door
       // having a grammar of its own.
-      reply(id, { content: [{ type: 'text', text: (await runUse(commandWords(String(cmd == null ? '' : cmd)))).join('\n') }] });
+      // The handshake and the tool description carry the standing verdict, but a
+      // check can land after both — and the only other door into an agent's context
+      // is a tool result. So a result that has not already answered the question
+      // gets one line. It reads the same file: no request, no waiting.
+      const lines = await runUse(commandWords(String(cmd == null ? '' : cmd)));
+      reply(id, { content: [{ type: 'text', text: withUpdateNote(lines, checkUpdate).join('\n') }] });
     } catch (e) {
       // die() has already written the reason to stderr; the caller gets it as a
       // tool result, and the server stays up — a refusal is not a crash.
@@ -1460,11 +1550,13 @@ function serveMcp({ checkUpdate }) {
         protocolVersion: (msg.params && msg.params.protocolVersion) || MCP_PROTOCOL,
         capabilities: { tools: {} },
         serverInfo: { name: 'termcp-wrapper', version: pkg.version },
-        instructions: MCP_INSTRUCTIONS + (checkUpdate ? MCP_CHECKUPDATE : ''),
+        instructions: MCP_INSTRUCTIONS + (checkUpdate
+          ? MCP_CHECKUPDATE + (() => { const note = updateNote(); return note ? ' ' + note : ''; })()
+          : ''),
       });
     }
     if (method === 'ping') return reply(id, {});
-    if (method === 'tools/list') return reply(id, { tools });
+    if (method === 'tools/list') return reply(id, { tools: toolsNow() });
     if (method === 'tools/call') { queue = queue.then(() => call(id, msg.params)).catch(() => {}); return; }
     return fail(id, -32601, `method not found: ${method}`);
   }

@@ -14,11 +14,32 @@ npm i -g @open-mcp-ai/termcp         # 或装出 termcp 命令
 
 ## MCP
 
+只要终端工具（termcp v0.2.5+）：
+
 ```json
 {
   "mcpServers": {
-    "termcp":     { "command": "npx", "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"] },
-    "termcp-use": { "command": "npx", "args": ["-y", "@open-mcp-ai/termcp", "use", "--mcp", "--checkupdate"] }
+    "termcp": {
+      "command": "npx",
+      "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"]
+    }
+  }
+}
+```
+
+再想让 agent 也管版本，就加第二个 server：它只提供一个 tool `use`，接受的行和 shell 里一样。
+
+```json
+{
+  "mcpServers": {
+    "termcp": {
+      "command": "npx",
+      "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"]
+    },
+    "termcp-use": {
+      "command": "npx",
+      "args": ["-y", "@open-mcp-ai/termcp", "use", "--mcp", "--checkupdate"]
+    }
   }
 }
 ```
@@ -28,8 +49,8 @@ claude mcp add termcp     -- npx -y @open-mcp-ai/termcp daemon stdio
 claude mcp add termcp-use -- npx -y @open-mcp-ai/termcp use --mcp --checkupdate
 ```
 
-`termcp` 提供 `term`（v0.2.5+）；`termcp-use` 只提供一个 tool `use`，唯一参数就是下一节那些行。
-`--checkupdate` 不给 tool 加东西 —— 它往提示词里加一条：会话开始查一次，有更新就说出来。
+`--checkupdate` 让这个 server 在运行期间自己后台查更新，把结果写进握手的 instructions、tool 描述，
+以及没自己回答过这个问题的工具结果末尾。它只读自己写下的那个文件：从不为此等 GitHub，所以旧答案也算答案。
 
 ## `use`
 
@@ -44,17 +65,24 @@ use --rm <版本>                                     删掉一个已装的发�
 use --mcp [--checkupdate]                           以 MCP 提供上面这些
 ```
 
-- **是选择，不是安装。** 启动跑 `~/.termcp/.version` 里的一行；字节下次启动才到，
-  运行中的实例在那之前仍用旧二进制。
-- **`--kill` 是唯一执行命令的动作**：跑盘上二进制的 `daemon stop`。为了停东西不下载、
-  不安装，没装过的版本直接拒绝，不会被执行。
-- **其余的词原样交给二进制。**
-- **渠道**就是一条线（`v0.2.8` stable、`v0.2.8-rc.2` rc、`nightly-20261002` nightly）。
-  `--channel` 收逗号列表，只对 `latest`、`--list`、`--check` 有效。`--check` 只判决当前
-  那条线，答案复用一天（`--delay`；`--force` 当场问）。三个事实放在
-  `~/.termcp/.check/{channel,delay,lastcheck}`；`channel` 是范围，不是许可。
-- **`--bin`** 让每次启动跑自己的构建（参数保留）：`~/.termcp/.bin` 里的一行
-  （`use --bin off` 清掉）。`TERMCP_BIN` 同样只影响一次。
+**切换版本不下载。** `use <版本>` 只是把选择写进 `~/.termcp/.version`；真正的下载发生在你
+下一次运行 termcp 的时候。已经装过的版本是离线瞬时切换；已经在运行的实例继续用它启动时的
+版本，直到被停掉。
+
+**`--kill` 是唯一会执行命令的动作。** 它调用盘上已有的 termcp 的 `daemon stop` —— 为了停一个
+进程不会去下载或安装任何东西。如果选中的版本根本没装，就直接拒绝，而不是先装一个再来停。
+
+**其他词原样交给 termcp**，所以 `termcp --version`、`termcp daemon stdio`，甚至
+`termcp nonsense`，都跟没装这层包装一样。
+
+**渠道**是发行版的线：`v0.2.8` 属于 stable，`v0.2.8-rc.2` 属于 rc，`nightly-20261002` 属于
+nightly。`--channel` 收逗号分隔的名字，只对 `use latest`、`--list`、`--check` 有效。`--check`
+只判断你当前所在的那条线；其他线只告诉你它们最新的版本，不判断你是否落后。检查结果缓存一天
+（`--delay` 可改，`--force` 立刻重新查）。缓存和设置放在 `~/.termcp/.check/`
+（`channel`、`delay`、`lastcheck`）；`channel` 只决定默认检查哪些线，不会拒绝任何线。
+
+**`--bin`** 让每次启动跑你自己的构建（参数保留），记在 `~/.termcp/.bin`，
+`use --bin off` 清除；`TERMCP_BIN` 只影响一次运行。
 
 ## 环境变量
 
@@ -72,7 +100,12 @@ use --mcp [--checkupdate]                           以 MCP 提供上面这些
 
 ## 卸载
 
-删掉 `~/.termcp`（或 `$TERMCP_DATA_DIR`）。
+```bash
+npm uninstall -g @open-mcp-ai/termcp
+```
+
+然后删掉 `~/.termcp`（设了 `$TERMCP_DATA_DIR` 就删那个）—— 东西都在这里：
+`versions/` 下下载的二进制、会话、配置。
 
 ## 许可证
 

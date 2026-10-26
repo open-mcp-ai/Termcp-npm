@@ -13,11 +13,33 @@ Node 18+; no Go toolchain (the binary is fetched prebuilt, ~13 MB).
 
 ## MCP
 
+Just the terminal tool (termcp v0.2.5+):
+
 ```json
 {
   "mcpServers": {
-    "termcp":     { "command": "npx", "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"] },
-    "termcp-use": { "command": "npx", "args": ["-y", "@open-mcp-ai/termcp", "use", "--mcp", "--checkupdate"] }
+    "termcp": {
+      "command": "npx",
+      "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"]
+    }
+  }
+}
+```
+
+Add a second server if you also want an agent to manage releases: it serves one
+tool, `use`, and takes the same lines as the shell.
+
+```json
+{
+  "mcpServers": {
+    "termcp": {
+      "command": "npx",
+      "args": ["-y", "@open-mcp-ai/termcp", "daemon", "stdio"]
+    },
+    "termcp-use": {
+      "command": "npx",
+      "args": ["-y", "@open-mcp-ai/termcp", "use", "--mcp", "--checkupdate"]
+    }
   }
 }
 ```
@@ -27,9 +49,10 @@ claude mcp add termcp     -- npx -y @open-mcp-ai/termcp daemon stdio
 claude mcp add termcp-use -- npx -y @open-mcp-ai/termcp use --mcp --checkupdate
 ```
 
-`termcp` serves `term` (v0.2.5+); `termcp-use` serves one tool, `use`, whose only
-argument is the line below. `--checkupdate` adds no tool — it adds an order to the
-prompt: check at session start, and say so if a newer release exists.
+`--checkupdate` makes that server check for newer releases in the background while
+it runs, and state what it found — in the handshake, in the tool description, and at
+the end of a tool result that did not already answer it. It only ever reads the file
+it wrote: nothing waits for GitHub, so a stale answer is still an answer.
 
 ## `use`
 
@@ -44,21 +67,31 @@ use --rm <tag>                                      delete an installed release
 use --mcp [--checkupdate]                           serve this over MCP
 ```
 
-- **Selects, does not install.** A launch runs one line of `~/.termcp/.version`;
-  the bytes arrive on the next launch, and a running instance keeps the old binary.
-- **`--kill` is the only action that runs a command**: the binary's `daemon stop`
-  from disk. Nothing is downloaded or installed to stop something, and a version
-  that was never installed is refused, not run.
-- **Any other word goes straight to the binary.**
-- **Channels** are lines of releases (`v0.2.8` stable, `v0.2.8-rc.2` rc,
-  `nightly-20261002` nightly). `--channel` takes a comma-separated list, only on
-  `latest`, `--list` and `--check`. `--check` judges the line in use only and
-  reuses its answer for a day (`--delay`; `--force` asks now). The three facts
-  live in `~/.termcp/.check/{channel,delay,lastcheck}`; `channel` is a scope, not
-  a permission.
-- **`--bin`** points every launch at your own build, arguments included: one line
-  in `~/.termcp/.bin` (`use --bin off` clears it). `TERMCP_BIN` does the same for
-  one run.
+**Switching costs no download.** `use <tag>` writes the choice to
+`~/.termcp/.version`; the bytes are fetched the next time you run termcp. A
+version already installed is an instant, offline switch. An instance that is
+already running keeps the version it started with until it is stopped.
+
+**`--kill` is the only action that runs a command.** It calls `daemon stop` on the
+termcp already on disk — nothing is downloaded or installed to stop a process. If
+the selected version was never installed, the command is refused rather than
+installing something just to stop it.
+
+**Every other word goes straight to termcp**, so `termcp --version`,
+`termcp daemon stdio` and even `termcp nonsense` behave as if this wrapper were
+not installed.
+
+**Channels** are the release lines: `v0.2.8` is stable, `v0.2.8-rc.2` is rc,
+`nightly-20261002` is nightly. `--channel` takes a comma-separated list and only
+applies to `use latest`, `--list` and `--check`. `--check` only judges the line you
+are on; other lines are told their newest tag but not whether you are behind. Its
+answer is cached for a day (`--delay` changes that, `--force` asks now). The cache
+and settings live in `~/.termcp/.check/` (`channel`, `delay`, `lastcheck`);
+`channel` only decides what a check looks at by default, and never refuses a line.
+
+**`--bin`** makes every launch run your own build instead (arguments included). It
+is remembered in `~/.termcp/.bin`, and `use --bin off` clears it. `TERMCP_BIN`
+does the same for a single run.
 
 ## Environment
 
@@ -76,7 +109,12 @@ use --mcp [--checkupdate]                           serve this over MCP
 
 ## Uninstall
 
-Delete `~/.termcp` (or `$TERMCP_DATA_DIR`).
+```bash
+npm uninstall -g @open-mcp-ai/termcp
+```
+
+Then delete `~/.termcp` (or `$TERMCP_DATA_DIR` if you set it) — everything lives
+there: downloaded binaries under `versions/`, sessions, and config.
 
 ## License
 

@@ -736,13 +736,14 @@ function mcpClient(dir, env = {}, args = ['use', '--mcp']) {
     let apiCalls = 0;
     const api = await releasesAPI(() => { apiCalls++; return releases; });
     const asset = await mirror(body, { tag: 'fake' });
-    const mcp = mcpClient(dir, { TERMCP_API: api.url, TERMCP_MIRROR: asset.url }, ['use', '--mcp', '--checkupdate']);
+    const mcp = mcpClient(dir, { TERMCP_API: api.url, TERMCP_MIRROR: asset.url }, ['use', '--mcp']);
     const call = (cmd) => mcp.request('tools/call', { name: 'use', arguments: cmd === undefined ? {} : { cmd } });
     const text = (res) => res.result.content[0].text;
 
     const init = await mcp.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
     assert.equal(init.result.protocolVersion, '2025-06-18', 'the client’s protocol version must come back');
-    assert.match(init.result.instructions, /run `use --check` once/, '--checkupdate must reach the prompt: ' + init.result.instructions);
+    assert.match(init.result.instructions, /Every action is an option of `use`/, 'the handshake must describe the surface: ' + init.result.instructions);
+    assert.ok(!/update:/.test(init.result.instructions), 'a plain server must not carry an update verdict: ' + init.result.instructions);
     mcp.notify('notifications/initialized');
     const tools = await mcp.request('tools/list');
     assert.equal(tools.result.tools.length, 1, 'one tool, not a pile: ' + JSON.stringify(tools.result.tools.map((t) => t.name)));
@@ -932,16 +933,80 @@ function mcpClient(dir, env = {}, args = ['use', '--mcp']) {
     console.log('ok: the tool can point launches at a command, and says so afterwards');
 
     // --checkupdate changes what the agent is TOLD, not what it can do: `check` is
-    // always callable, and the flag adds the standing order to go look and report.
+    // always callable, and the flag adds the standing check — the server keeps the
+    // cache warm in the background and the handshake states the verdict. Nobody is
+    // asked to spend a call asking, which is the whole point.
     const plain = mcpClient(dir, { TERMCP_API: api.url });
     const plainInit = await plain.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
     const plainTools = await plain.request('tools/list');
-    assert.ok(!/run `use --check` once/.test(plainInit.result.instructions), 'a plain server must not order a check: ' + plainInit.result.instructions);
-    assert.ok(!/run `use --check` once/.test(plainTools.result.tools[0].description), 'and must not say it in the tool: ' + plainTools.result.tools[0].description);
+    assert.ok(!/update:/.test(plainInit.result.instructions), 'a plain server must not carry a verdict: ' + plainInit.result.instructions);
+    assert.ok(!/update:/.test(plainTools.result.tools[0].description), 'and must not say it in the tool: ' + plainTools.result.tools[0].description);
     const plainCheck = await plain.request('tools/call', { name: 'use', arguments: { cmd: 'use --check' } });
     assert.ok(!plainCheck.result.isError, 'check must work without the flag: ' + plainCheck.result.content[0].text);
     assert.equal(await plain.close(), 0);
-    console.log('ok: `check` is always callable; `--checkupdate` adds the order to go and look');
+
+    // Yesterday's answer is an answer: a stale cache is read as it is, and nothing
+    // here waits for GitHub. The proof is that the verdict names what only the FILE
+    // says (v9.0.1) while the API — unreachable on purpose — would have said v9.0.2.
+    const staleDir = path.join(os.tmpdir(), `termcp-stale-${process.pid}`);
+    fs.rmSync(staleDir, { recursive: true, force: true });
+    fs.mkdirSync(path.join(staleDir, '.check'), { recursive: true });
+    fs.writeFileSync(path.join(staleDir, '.version'), 'v0.2.7\n');
+    fs.writeFileSync(path.join(staleDir, '.releases-cache.json'), JSON.stringify([{ tag_name: 'v8.8.8', draft: false, prerelease: false, assets: [] }, { tag_name: 'v9.0.1', draft: false, prerelease: false, assets: [] }]));
+    fs.writeFileSync(path.join(staleDir, '.check', 'lastcheck'), new Date(Date.now() - 30 * 3600 * 1000).toISOString());
+    const stale = mcpClient(staleDir, { TERMCP_API: 'http://127.0.0.1:1' }, ['use', '--mcp', '--checkupdate']);
+    const staleInit = await stale.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
+    assert.match(staleInit.result.instructions, /update: v9\.0\.1 is newer on stable than the current v0\.2\.7/, 'the handshake must read the file it has: ' + staleInit.result.instructions);
+    assert.match(staleInit.result.instructions, /checked 30 h ago/, 'and say how old it is: ' + staleInit.result.instructions);
+    // A check can land after the handshake, so a result that did not already answer
+    // the question carries the same sentence — no extra call, no waiting.
+    const staleStatus = await stale.request('tools/call', { name: 'use', arguments: {} });
+    assert.match(staleStatus.result.content[0].text, /^update: v9\.0\.1 is newer on stable/m, 'a result must carry the standing verdict: ' + staleStatus.result.content[0].text);
+    const staleCheck = await stale.request('tools/call', { name: 'use', arguments: { cmd: 'use --check' } });
+    assert.ok(!/^update: /m.test(staleCheck.result.content[0].text), 'and must not repeat what `--check` already said: ' + staleCheck.result.content[0].text);
+    assert.equal(await stale.close(), 0);
+    fs.rmSync(staleDir, { recursive: true, force: true });
+    console.log('ok: a stale verdict is read off the disk, and a tool result carries it when the command did not');
+
+    // The standing check, in a data dir of its own so the fetch is real: the server
+    // asks GitHub by itself before anyone says anything and writes the cache, then
+    // the handshake (and the tool description, for an agent that never re-reads the
+    // handshake) states what that file says. A handshake must never WAIT for a
+    // request — a client times out — so the proof is that it still answers after
+    // the cache is taken away.
+    const watch = path.join(os.tmpdir(), `termcp-watched-${process.pid}`);
+    fs.rmSync(watch, { recursive: true, force: true });
+    fs.mkdirSync(watch, { recursive: true });
+    fs.writeFileSync(path.join(watch, '.version'), 'v0.2.7\n');
+    const callsBeforeWatching = apiCalls;
+    const watched = mcpClient(watch, { TERMCP_API: api.url }, ['use', '--mcp', '--checkupdate']);
+    const cache = path.join(watch, '.releases-cache.json');
+    for (let i = 0; i < 100 && !fs.existsSync(cache); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.ok(fs.existsSync(cache), 'the server must check in the background and write the cache');
+    assert.equal(apiCalls, callsBeforeWatching + 1, 'and that is one request nobody asked for');
+    const watchedInit = await watched.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
+    assert.match(watchedInit.result.instructions, /checks for newer releases in the background/, 'the flag must be described: ' + watchedInit.result.instructions);
+    assert.match(watchedInit.result.instructions, /update: v9\.0\.2 is newer on stable than the current v0\.2\.7/, 'the handshake must state the verdict: ' + watchedInit.result.instructions);
+    assert.match(watchedInit.result.instructions, /checked just now/, 'and when it was checked: ' + watchedInit.result.instructions);
+    const watchedTools = await watched.request('tools/list');
+    assert.match(watchedTools.result.tools[0].description, /update: v9\.0\.2 is newer/, 'the tool description must carry it too: ' + watchedTools.result.tools[0].description);
+    assert.equal(apiCalls, callsBeforeWatching + 1, 'the handshake and the tool list must read the file, not GitHub');
+    // Up to date is said as plainly as behind, so silence never reads as "no news".
+    await watched.request('tools/call', { name: 'use', arguments: { cmd: 'use v9.0.2' } });
+    const current = await watched.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
+    assert.match(current.result.instructions, /update: v9\.0\.2 is the newest on stable/, 'expected the up-to-date verdict: ' + current.result.instructions);
+    // No file, no answer — and still no request: that is the difference between a
+    // handshake that reports and one that waits twenty seconds on GitHub.
+    // The baseline is taken here, after the switch above (a switch resolves against a
+    // fresh list, so it is one request of its own).
+    fs.rmSync(cache, { force: true });
+    const callsBeforeHandshake = apiCalls;
+    const starved = await watched.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
+    assert.match(starved.result.instructions, /update: no check has run yet/, 'expected the empty verdict: ' + starved.result.instructions);
+    assert.equal(apiCalls, callsBeforeHandshake, 'a handshake must never fetch');
+    assert.equal(await watched.close(), 0);
+    fs.rmSync(watch, { recursive: true, force: true });
+    console.log('ok: `--checkupdate` checks in the background; the handshake and the tool state the verdict without fetching');
 
     // The cache is spent by the clock, so an exhausted or unreachable API still
     // has an answer — and TERMCP_CACHE_MINUTES=0 refuses to use it at all.
